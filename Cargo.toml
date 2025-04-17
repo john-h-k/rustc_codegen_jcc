@@ -1,0 +1,15 @@
+[package]
+name = "rustc_codegen_jcc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib"]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[build-dependencies]
+bindgen = "0.71.1"
+
+[dependencies]
