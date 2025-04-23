@@ -1,0 +1,5 @@
+#include "ir/ir.h"
+#include "compiler.h"
+#include "fs.h"
+#include "alloc.h"
+#include "aarch64.h"
