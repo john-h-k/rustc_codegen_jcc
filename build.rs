@@ -24,6 +24,7 @@ fn main() {
         .allowlist_file(".*/compiler.h")
         .allowlist_file(".*/fs.h")
         .allowlist_file(".*/ir/ir.h")
+        .allowlist_file(".*/ir/prettyprint.h")
         .clang_arg("-I../jcc/src")
         .derive_default(true)
         .derive_debug(true)

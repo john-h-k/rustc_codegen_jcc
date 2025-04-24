@@ -13,3 +13,4 @@ rustc_private = true
 bindgen = "0.71.1"
 
 [dependencies]
+bitflags = "2.9.0"

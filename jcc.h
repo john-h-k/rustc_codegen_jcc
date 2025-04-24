@@ -1,4 +1,5 @@
 #include "ir/ir.h"
+#include "ir/prettyprint.h"
 #include "compiler.h"
 #include "fs.h"
 #include "alloc.h"

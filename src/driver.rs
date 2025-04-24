@@ -1,5 +1,7 @@
 use std::{
+    cell::RefCell,
     ffi::{self, CString},
+    num::NonZeroUsize,
     ptr,
 };
 
@@ -13,20 +15,31 @@ use rustc_codegen_ssa::{
         PreDefineCodegenMethods, StaticCodegenMethods, TypeMembershipCodegenMethods,
     },
 };
-use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_data_structures::{fx::FxHashMap, profiling::SelfProfilerRef};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
-    mir::{BasicBlock, BasicBlockData, Statement, StatementKind, TerminatorKind, mono::MonoItem},
+    mir::{
+        BasicBlock, BasicBlockData, Statement, StatementKind, TerminatorKind,
+        mono::{CodegenUnit, MonoItem},
+    },
     ty::{
-        EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv,
-        layout::{FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers},
+        self, EarlyBinder, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
+        layout::{FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout},
     },
 };
+use rustc_session::Session;
 use rustc_span::{Symbol, def_id::DefId};
+use rustc_target::callconv::CastTarget;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
 use crate::{
-    jcc::{self, ArenaAlloc, IrBasicBlock, IrFunc, IrOp, IrVarTy},
+    jcc::{
+        alloc::ArenaAllocRef,
+        ir::{
+            self, AddrOffset, IrBasicBlock, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp, IrUnit,
+            IrVarTy, IrVarTyFuncFlags,
+        },
+    },
     jcc_sys::{self, IR_FUNC_FLAG_NONE},
 };
 
@@ -48,50 +61,50 @@ trait TypedDebug: Debug {
 
 impl<T: ?Sized + Debug> TypedDebug for T {}
 
-fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: &Ty<'tcx>) -> jcc_sys::ir_var_ty {
-    unsafe {
-        // TODO: ptr-size ty
-        let pointer_ty = jcc_sys::IR_VAR_TY_I64;
-
-        match ty.kind() {
-            TyKind::Never => jcc_sys::IR_VAR_TY_NONE,
-            TyKind::Tuple(tys) if tys.len() == 0 => jcc_sys::IR_VAR_TY_NONE,
-            TyKind::Bool => jcc_sys::IR_VAR_TY_I1,
-            TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => jcc_sys::IR_VAR_TY_I8,
-            TyKind::Char => jcc_sys::IR_VAR_TY_I32,
-            TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => jcc_sys::IR_VAR_TY_I16,
-            TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) => jcc_sys::IR_VAR_TY_I32,
-            TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => jcc_sys::IR_VAR_TY_I64,
-            TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => pointer_ty,
-            TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => jcc_sys::IR_VAR_TY_I128,
-            TyKind::Float(FloatTy::F16) => jcc_sys::IR_VAR_TY_F16,
-            TyKind::Float(FloatTy::F32) => jcc_sys::IR_VAR_TY_F32,
-            TyKind::Float(FloatTy::F64) => jcc_sys::IR_VAR_TY_F64,
-            TyKind::Float(FloatTy::F128) => todo!("f128"),
-            TyKind::FnPtr(..) => pointer_ty,
-            TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
-                if tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()) {
-                    panic!("ptr with metadata");
-                } else {
-                    pointer_ty
-                }
+fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, unit: &IrUnit, ty: &Ty<'tcx>) -> IrVarTy {
+    match ty.kind() {
+        TyKind::Never => unit.none(),
+        TyKind::Tuple(tys) if tys.len() == 0 => unit.none(),
+        TyKind::Bool => unit.integer(IrIntTy::I1),
+        TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => unit.integer(IrIntTy::I8),
+        TyKind::Char => unit.integer(IrIntTy::I32),
+        TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => unit.integer(IrIntTy::I16),
+        TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) => unit.integer(IrIntTy::I32),
+        TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => unit.integer(IrIntTy::I64),
+        // FIXME: should be ptr-sized int
+        TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => unit.pointer(),
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => unit.integer(IrIntTy::I128),
+        TyKind::Float(FloatTy::F16) => unit.float(IrFloatTy::F16),
+        TyKind::Float(FloatTy::F32) => unit.float(IrFloatTy::F32),
+        TyKind::Float(FloatTy::F64) => unit.float(IrFloatTy::F64),
+        TyKind::Float(FloatTy::F128) => todo!("f128"),
+        TyKind::FnPtr(..) => unit.pointer(),
+        TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
+            if tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()) {
+                panic!("ptr with metadata");
+            } else {
+                unit.pointer()
             }
-            _ => panic!("bad ty {ty:?}, {:?}", ty.kind().typed_debug()),
         }
+        _ => panic!("bad ty {ty:?}, {:?}", ty.kind().typed_debug()),
     }
 }
 
 pub(crate) struct JccModule {
-    pub(crate) unit: *mut jcc_sys::ir_unit,
+    pub(crate) unit: IrUnit,
 }
 
 unsafe impl Send for JccModule {}
 unsafe impl Sync for JccModule {}
 
 pub struct CodegenCx<'tcx> {
-    arena: ArenaAlloc,
-    tcx: TyCtxt<'tcx>,
-    unit: *mut jcc_sys::ir_unit,
+    pub tcx: TyCtxt<'tcx>,
+    pub unit: IrUnit,
+
+    pub fn_map: RefCell<FxHashMap<Instance<'tcx>, IrGlb>>,
+    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrOp>>,
+
+    pub cur_bb: RefCell<Option<IrBasicBlock>>,
 }
 
 impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
@@ -129,28 +142,26 @@ impl<'tcx> HasDataLayout for CodegenCx<'tcx> {
 }
 
 impl<'tcx> HasTyCtxt<'tcx> for CodegenCx<'tcx> {
-    fn tcx(&self) -> rustc_middle::ty::TyCtxt<'tcx> {
+    fn tcx(&self) -> ty::TyCtxt<'tcx> {
         self.tcx
     }
 }
 
 impl<'tcx> HasTypingEnv<'tcx> for CodegenCx<'tcx> {
-    fn typing_env(&self) -> rustc_middle::ty::TypingEnv<'tcx> {
-        todo!()
+    fn typing_env(&self) -> ty::TypingEnv<'tcx> {
+        TypingEnv::fully_monomorphized()
     }
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'tcx> {
-    type LayoutOfResult = rustc_middle::ty::layout::TyAndLayout<'tcx>;
+    type LayoutOfResult = TyAndLayout<'tcx>;
 
     fn handle_layout_err(
         &self,
-        err: rustc_middle::ty::layout::LayoutError<'tcx>,
+        err: ty::layout::LayoutError<'tcx>,
         span: rustc_span::Span,
         ty: Ty<'tcx>,
-    ) -> <Self::LayoutOfResult as rustc_middle::ty::layout::MaybeResult<
-        rustc_middle::ty::layout::TyAndLayout<'tcx>,
-    >>::Error {
+    ) -> <Self::LayoutOfResult as ty::layout::MaybeResult<TyAndLayout<'tcx>>>::Error {
         todo!()
     }
 }
@@ -160,10 +171,10 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
 
     fn handle_fn_abi_err(
         &self,
-        err: rustc_middle::ty::layout::FnAbiError<'tcx>,
+        err: ty::layout::FnAbiError<'tcx>,
         span: rustc_span::Span,
-        fn_abi_request: rustc_middle::ty::layout::FnAbiRequest<'tcx>,
-    ) -> <Self::FnAbiOfResult as rustc_middle::ty::layout::MaybeResult<
+        fn_abi_request: ty::layout::FnAbiRequest<'tcx>,
+    ) -> <Self::FnAbiOfResult as ty::layout::MaybeResult<
         &'tcx rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
     >>::Error {
         todo!()
@@ -257,18 +268,15 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         &self,
     ) -> &std::cell::RefCell<
         rustc_data_structures::fx::FxHashMap<
-            (
-                Ty<'tcx>,
-                Option<rustc_middle::ty::ExistentialTraitRef<'tcx>>,
-            ),
+            (Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>),
             Self::Value,
         >,
     > {
-        todo!()
+        &self.vtables
     }
 
     fn get_fn(&self, instance: Instance<'tcx>) -> Self::Function {
-        todo!()
+        self.fn_map.borrow()[&instance].func()
     }
 
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
@@ -279,11 +287,11 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         todo!()
     }
 
-    fn sess(&self) -> &rustc_session::Session {
-        todo!()
+    fn sess(&self) -> &Session {
+        &self.tcx.sess
     }
 
-    fn codegen_unit(&self) -> &'tcx rustc_middle::mir::mono::CodegenUnit<'tcx> {
+    fn codegen_unit(&self) -> &'tcx CodegenUnit<'tcx> {
         todo!()
     }
 
@@ -301,11 +309,11 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
 }
 
 impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
-    fn backend_type(&self, layout: rustc_middle::ty::layout::TyAndLayout<'tcx>) -> Self::Type {
+    fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
         todo!()
     }
 
-    fn cast_backend_type(&self, ty: &rustc_target::callconv::CastTarget) -> Self::Type {
+    fn cast_backend_type(&self, ty: &CastTarget) -> Self::Type {
         todo!()
     }
 
@@ -327,24 +335,28 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         todo!()
     }
 
-    fn immediate_backend_type(
-        &self,
-        layout: rustc_middle::ty::layout::TyAndLayout<'tcx>,
-    ) -> Self::Type {
+    fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
         todo!()
     }
 
-    fn is_backend_immediate(&self, layout: rustc_middle::ty::layout::TyAndLayout<'tcx>) -> bool {
-        todo!()
+    fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
+        match layout.ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(..)
+            | TyKind::Uint(..)
+            | TyKind::Float(..) => true,
+            _ => false,
+        }
     }
 
-    fn is_backend_scalar_pair(&self, layout: rustc_middle::ty::layout::TyAndLayout<'tcx>) -> bool {
-        todo!()
+    fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool {
+        false
     }
 
     fn scalar_pair_element_backend_type(
         &self,
-        layout: rustc_middle::ty::layout::TyAndLayout<'tcx>,
+        layout: TyAndLayout<'tcx>,
         index: usize,
         immediate: bool,
     ) -> Self::Type {
@@ -468,7 +480,16 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_ptr_byte_offset(&self, val: Self::Value, offset: rustc_abi::Size) -> Self::Value {
-        todo!()
+        let Some(offset) = NonZeroUsize::new(offset.bytes_usize()) else {
+            return val;
+        };
+
+        let offset = AddrOffset::offset(val, offset);
+
+        let op = val.stmt().alloc_op();
+        op.mk_addr_offset(offset);
+
+        op
     }
 }
 
@@ -476,7 +497,7 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn create_vtable_debuginfo(
         &self,
         ty: Ty<'tcx>,
-        trait_ref: Option<rustc_middle::ty::ExistentialTraitRef<'tcx>>,
+        trait_ref: Option<ty::ExistentialTraitRef<'tcx>>,
         vtable: Self::Value,
     ) {
         todo!()
@@ -495,7 +516,8 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
             Self::DILocation,
         >,
     > {
-        todo!()
+        // TODO:
+        None
     }
 
     fn dbg_scope_fn(
@@ -581,21 +603,63 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         visibility: rustc_middle::mir::mono::Visibility,
         symbol_name: &str,
     ) {
-        todo!()
+        let kind = instance
+            .ty(self.tcx, TypingEnv::fully_monomorphized())
+            .kind();
+
+        let def_id = instance.def.def_id();
+        let param_env = self.tcx.param_env(def_id);
+
+        let sig = kind.fn_sig(self.tcx).skip_binder();
+
+        let params = sig.inputs();
+        let ret = sig.output();
+
+        let unit = self.unit;
+
+        let params = params
+            .iter()
+            .map(|ty| ty_to_jcc_ty(self.tcx, &unit, ty))
+            .collect::<Vec<_>>();
+
+        let ret = ty_to_jcc_ty(self.tcx, &unit, &ret);
+
+        // FIXME: variadic flag for variadic fn
+        let fun_ty = unit.func(&params[..], &ret, IrVarTyFuncFlags::None);
+
+        let glb = unit.add_global_def_func(fun_ty, symbol_name);
+        let fun = glb.func();
+
+        let param_stmt = fun.mk_param_stmt();
+        for param in params {
+            if param.is_aggregate() {
+                let lcl = fun.add_local(param);
+
+                let op = param_stmt.alloc_op();
+                op.mk_lcl_param(param);
+            } else {
+                let op = param_stmt.alloc_op();
+                op.mk_mov_param(param);
+            }
+        }
+
+        self.fn_map.borrow_mut().insert(instance, glb);
     }
 }
 
 impl<'tcx> CodegenCx<'tcx> {
     pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Self {
-        let arena = ArenaAlloc::new();
-        let unit = jcc_sys::ir_unit {
-            arena: arena.as_ptr(),
-            target: unsafe { &jcc_sys::AARCH64_MACOS_TARGET },
-            ..Default::default()
-        };
-        let unit = Box::into_raw(Box::new(unit));
+        let unit = IrUnit::new();
+        let fn_map = RefCell::new(FxHashMap::default());
+        let vtables = RefCell::new(FxHashMap::default());
 
-        Self { tcx, arena, unit }
+        Self {
+            tcx,
+            unit,
+            fn_map,
+            vtables,
+            cur_bb: RefCell::new(None),
+        }
     }
 
     pub(crate) fn codegen_stmt(&mut self, inst: &Instance<'tcx>, stmt: &Statement<'tcx>) {
@@ -722,142 +786,11 @@ impl<'tcx> CodegenCx<'tcx> {
         }
     }
 
-    pub(crate) fn codegen_fn(&mut self, inst: &Instance<'tcx>) {
-        let kind = inst.ty(self.tcx, TypingEnv::fully_monomorphized()).kind();
-
-        match kind {
-            TyKind::FnDef(_, _) | TyKind::Closure(_, _) | TyKind::Coroutine(_, _) => {}
-            _ => return,
-        }
-
-        let mir = self.tcx.instance_mir(inst.def);
-        let sym = self.tcx.symbol_name(*inst).name;
-
-        let def_id = inst.def.def_id();
-        let param_env = self.tcx.param_env(def_id);
-
-        let sig = kind.fn_sig(self.tcx).skip_binder();
-
-        let params = sig.inputs();
-        let ret_ty = sig.output();
-
-        let fun_ty = jcc_sys::ir_var_func_ty {
-            ret_ty: Box::into_raw(Box::new(ty_to_jcc_ty(self.tcx, &ret_ty))),
-            num_params: params.len(),
-            params: params
-                .iter()
-                .map(|ty| ty_to_jcc_ty(self.tcx, ty))
-                .collect::<Vec<_>>()
-                .leak()
-                .as_mut_ptr(),
-            flags: jcc_sys::IR_VAR_FUNC_TY_FLAG_NONE,
-        };
-
-        let mut fun_var_ty = jcc_sys::ir_var_ty {
-            ty: jcc_sys::IR_VAR_TY_TY_FUNC,
-            _1: jcc_sys::ir_var_ty__bindgen_ty_1 { func: fun_ty },
-        };
-
-        let glb = unsafe {
-            jcc_sys::ir_add_global(
-                self.unit,
-                jcc_sys::IR_GLB_TY_FUNC,
-                &mut fun_var_ty,
-                jcc_sys::IR_GLB_DEF_TY_DEFINED,
-                CString::new(sym.to_string()).unwrap().into_raw(),
-            )
-        };
-
-        unsafe {
-            (*glb).linkage = jcc_sys::IR_LINKAGE_EXTERNAL;
-            (*glb)._1.func = self.arena.alloc::<jcc_sys::ir_func>();
-
-            *(*glb)._1.func = jcc_sys::ir_func {
-                unit: self.unit,
-                func_ty: fun_ty,
-                name: CString::new(sym).unwrap().into_raw(),
-                arena: self.arena.as_ptr(),
-                flags: IR_FUNC_FLAG_NONE,
-                ..Default::default()
-            };
-        }
-
-        let fun = unsafe { (*glb)._1.func };
-
-        let jcc_blocks = mir
-            .basic_blocks
-            .iter()
-            .map(|_| unsafe { jcc_sys::ir_alloc_basicblock(fun) })
-            .collect::<Vec<_>>();
-
-        unsafe {
-            let first = jcc_blocks[0];
-            let param_stmt = if (*first).first.is_null() {
-                jcc_sys::ir_alloc_stmt(fun, first)
-            } else {
-                jcc_sys::ir_insert_before_stmt(fun, (*first).first)
-            };
-
-            (*param_stmt).flags |= jcc_sys::IR_STMT_FLAG_PARAM;
-
-            for param in params {
-                let mut jcc_ty = ty_to_jcc_ty(self.tcx, param);
-
-                if jcc_ty.ty == jcc_sys::IR_VAR_TY_TY_STRUCT
-                    || jcc_ty.ty == jcc_sys::IR_VAR_TY_TY_UNION
-                {
-                    let lcl = jcc_sys::ir_add_local(fun, &jcc_ty);
-                    (*lcl).flags |= jcc_sys::IR_LCL_FLAG_PARAM;
-
-                    let addr = jcc_sys::ir_alloc_op(fun, param_stmt);
-                    (*addr).ty = jcc_sys::IR_OP_TY_ADDR;
-                    (*addr).var_ty = jcc_sys::IR_VAR_TY_POINTER;
-                    (*addr).flags |= jcc_sys::IR_OP_FLAG_PARAM;
-                    (*addr)._1.addr = jcc_sys::ir_op_addr {
-                        ty: jcc_sys::IR_OP_ADDR_TY_LCL,
-                        _1: jcc_sys::ir_op_addr__bindgen_ty_1 { lcl },
-                    };
-                } else {
-                    if jcc_ty.ty == jcc_sys::IR_VAR_TY_TY_ARRAY {
-                        // arrays/aggregates are actually pointers
-                        jcc_ty = jcc_sys::IR_VAR_TY_POINTER;
-                    }
-
-                    let lcl = jcc_sys::ir_add_local(fun, &jcc_ty);
-                    (*lcl).flags |= jcc_sys::IR_LCL_FLAG_PARAM;
-
-                    let mov = jcc_sys::ir_alloc_op(fun, param_stmt);
-                    (*mov).ty = jcc_sys::IR_OP_TY_MOV;
-                    (*mov).var_ty = jcc_ty;
-                    (*mov).flags |= jcc_sys::IR_OP_FLAG_PARAM;
-                    (*mov)._1.mov.value = ptr::null_mut();
-
-                    let store = jcc_sys::ir_alloc_op(fun, param_stmt);
-                    (*store).ty = jcc_sys::IR_OP_TY_STORE;
-                    (*store).var_ty = jcc_sys::IR_VAR_TY_NONE;
-                    (*store)._1.store = jcc_sys::ir_op_store {
-                        ty: jcc_sys::IR_OP_STORE_TY_LCL,
-                        value: mov,
-                        _1: jcc_sys::ir_op_store__bindgen_ty_1 { lcl },
-                    };
-                }
-            }
-        }
-
-        for (idx, block) in mir.basic_blocks.iter_enumerated() {
-            self.codegen_basic_block(inst, fun, &jcc_blocks, idx.index(), block);
-        }
-    }
-
     pub(crate) fn codegen_static(&mut self, def_id: &DefId) {
         let const_val = self
             .tcx
             .eval_static_initializer(def_id)
             .expect("eval_static_initializer failed");
-    }
-
-    pub(crate) fn tcx(&self) -> TyCtxt<'tcx> {
-        self.tcx
     }
 
     pub(crate) fn module(&self) -> JccModule {

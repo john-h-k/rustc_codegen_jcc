@@ -196,6 +196,7 @@ name = "rustc_codegen_jcc"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "bitflags",
 ]
 
 [[package]]

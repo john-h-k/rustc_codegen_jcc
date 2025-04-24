@@ -2,6 +2,7 @@
 #![feature(let_chains)]
 #![feature(f16, alloc_error_hook)]
 #![feature(allocator_api)]
+#![feature(ptr_as_ref_unchecked)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
@@ -11,6 +12,7 @@
 
 extern crate rustc_abi;
 
+extern crate memchr;
 extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
@@ -35,6 +37,10 @@ mod jcc_sys;
 
 use builder::Builder;
 use driver::{CodegenCx, JccModule};
+use jcc::{
+    alloc::{ArenaAlloc, ArenaAllocRef},
+    compiler::Compiler,
+};
 use rustc_ast::expand::{allocator::AllocatorKind, autodiff_attrs::AutoDiffItem};
 use rustc_codegen_ssa::{
     CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
@@ -183,12 +189,14 @@ impl ExtraBackendMethods for JccCodegenBackend {
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
     ) -> (ModuleCodegen<Self::Module>, u64) {
-        let builder = Builder::new(tcx);
+        let cx = CodegenCx::new(tcx);
+        let builder = Builder::with_cx(&cx);
 
         let cgu = tcx.codegen_unit(cgu_name);
 
         for (item, data) in cgu.items() {
-            item.predefine::<Builder<'_>>(&builder, data.linkage, data.visibility);
+            item.predefine::<Builder<'_, '_>>(&builder, data.linkage, data.visibility);
+            item.define::<Builder<'_, '_>>(&builder);
         }
 
         let module = builder.module();
@@ -322,50 +330,12 @@ impl WriteBackendMethods for JccCodegenBackend {
                 EmitObj::None => {}
                 EmitObj::Bitcode => todo!(),
                 EmitObj::ObjectCode(_bitcode_section) => {
-                    let mut fs = ptr::null_mut();
-                    let mut arena = ptr::null_mut();
-
-                    unsafe {
-                        jcc_sys::arena_allocator_create(
-                            CString::new("rustc_codegen_jcc2").unwrap().into_raw(),
-                            &mut arena,
-                        );
-
-                        jcc_sys::fs_create(arena, jcc_sys::FS_FLAG_ASSUME_CONSTANT, &mut fs);
-
-                        let target = &jcc_sys::AARCH64_MACOS_TARGET;
-
-                        let output = jcc_sys::compile_file {
-                            ty: jcc_sys::COMPILE_FILE_TY_PATH,
-                            path: CString::new(obj_out.into_os_string().into_vec())
-                                .unwrap()
-                                .into_raw(),
-                            file: ptr::null_mut(),
-                        };
-
-                        let args = jcc_sys::compiler_ir_create_args {
-                            fs,
-                            target,
-                            output,
-                            args: jcc_sys::compile_ir_args {
-                                target: jcc_sys::COMPILE_TARGET_MACOS_ARM64,
-                                log_flags: jcc_sys::COMPILE_LOG_FLAGS_ALL,
-                                opts_level: jcc_sys::COMPILE_OPTS_LEVEL_0,
-                                codegen_flags: jcc_sys::CODEGEN_FLAG_NONE,
-                                log_symbols: ptr::null_mut(),
-                                build_asm_file: false,
-                                build_object_file: true,
-                                verbose: false,
-                                use_graphcol_regalloc: false,
-                                output,
-                            },
-                        };
-
-                        let mut compiler = ptr::null_mut();
-                        jcc_sys::compiler_create_for_ir(&args, &mut compiler);
-
-                        jcc_sys::compile_ir(compiler, jcc_mod.unit);
-                    }
+                    // FIXME: should use shared arena
+                    let arena = ArenaAlloc::new(b"compiler");
+                    let mut compiler = Compiler::new(&arena, &obj_out);
+                    compiler
+                        .compile_ir(jcc_mod.unit)
+                        .expect("ir compilation failed");
                 }
             }
 

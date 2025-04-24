@@ -1,30 +1,38 @@
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 
-use rustc_abi::HasDataLayout;
-use rustc_codegen_ssa::traits::{
-    AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes, BuilderMethods,
-    CoverageInfoBuilderMethods, DebugInfoBuilderMethods, IntrinsicCallBuilderMethods,
-    StaticBuilderMethods,
+use rustc_abi::{HasDataLayout, TargetDataLayout};
+use rustc_codegen_ssa::{
+    mir::place::PlaceRef,
+    traits::{
+        AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes, BuilderMethods,
+        CoverageInfoBuilderMethods, DebugInfoBuilderMethods, IntrinsicCallBuilderMethods,
+        StaticBuilderMethods,
+    },
 };
-use rustc_middle::ty::{
-    TyCtxt,
-    layout::{FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers},
+use rustc_middle::{
+    mir::coverage::CoverageKind,
+    ty::{
+        Instance, Ty, TyCtxt, TypingEnv,
+        layout::{
+            FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTyCtxt, HasTypingEnv, LayoutError,
+            LayoutOfHelpers, MaybeResult, TyAndLayout,
+        },
+    },
 };
+use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 
 use crate::{
     CodegenCx, JccModule,
-    jcc::{IrBasicBlock, IrFunc, IrOp, IrVarTy},
+    jcc::ir::{IrBasicBlock, IrFunc, IrIntTy, IrOp, IrVarTy},
 };
 
-pub struct Builder<'tcx> {
-    cx: CodegenCx<'tcx>,
+pub struct Builder<'a, 'tcx> {
+    cx: &'a CodegenCx<'tcx>,
 }
 
-impl<'tcx> Builder<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            cx: CodegenCx::new(tcx),
-        }
+impl<'a, 'tcx> Builder<'a, 'tcx> {
+    pub fn with_cx(cx: &'a CodegenCx<'tcx>) -> Self {
+        Self { cx }
     }
 
     pub fn module(&self) -> JccModule {
@@ -32,7 +40,7 @@ impl<'tcx> Builder<'tcx> {
     }
 }
 
-impl<'tcx> BackendTypes for Builder<'tcx> {
+impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Value = IrOp;
 
     type Metadata = ();
@@ -45,20 +53,20 @@ impl<'tcx> BackendTypes for Builder<'tcx> {
     type DIVariable = ();
 }
 
-impl<'tcx> StaticBuilderMethods for Builder<'tcx> {
+impl<'a, 'tcx> StaticBuilderMethods for Builder<'a, 'tcx> {
     fn get_static(&mut self, def_id: rustc_hir::def_id::DefId) -> Self::Value {
         todo!()
     }
 }
 
-impl<'tcx> AsmBuilderMethods<'tcx> for Builder<'tcx> {
+impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_inline_asm(
         &mut self,
         template: &[rustc_ast::InlineAsmTemplatePiece],
         operands: &[rustc_codegen_ssa::traits::InlineAsmOperandRef<'tcx, Self>],
         options: rustc_ast::InlineAsmOptions,
         line_spans: &[rustc_span::Span],
-        instance: rustc_middle::ty::Instance<'_>,
+        instance: Instance<'_>,
         dest: Option<Self::BasicBlock>,
         catch_funclet: Option<(Self::BasicBlock, Option<&Self::Funclet>)>,
     ) {
@@ -66,15 +74,15 @@ impl<'tcx> AsmBuilderMethods<'tcx> for Builder<'tcx> {
     }
 }
 
-impl<'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'tcx> {
+impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_intrinsic_call(
         &mut self,
-        instance: rustc_middle::ty::Instance<'tcx>,
-        fn_abi: &rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
+        instance: Instance<'tcx>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value>],
         llresult: Self::Value,
         span: rustc_span::Span,
-    ) -> Result<(), rustc_middle::ty::Instance<'tcx>> {
+    ) -> Result<(), Instance<'tcx>> {
         todo!()
     }
 
@@ -112,40 +120,60 @@ impl<'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'tcx> {
     }
 }
 
-impl<'tcx> AbiBuilderMethods for Builder<'tcx> {
+impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
     fn get_param(&mut self, index: usize) -> Self::Value {
         todo!()
     }
 }
 
-impl<'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'tcx> {
+impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn store_fn_arg(
         &mut self,
-        arg_abi: &rustc_target::callconv::ArgAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
+        arg_abi: &ArgAbi<'tcx, Ty<'tcx>>,
         idx: &mut usize,
-        dst: rustc_codegen_ssa::mir::place::PlaceRef<'tcx, Self::Value>,
+        dst: PlaceRef<'tcx, Self::Value>,
     ) {
-        todo!()
+        // store argument passed to function, ie we are callee/receiver
+        let bb = self.cur_bb.borrow().unwrap();
+        let stmt = bb.alloc_stmt();
+
+        let addr = dst.val.llval;
+
+        let value = match arg_abi.mode {
+            PassMode::Ignore => return,
+            PassMode::Direct(arg_attributes) => {
+                // need to get the nth argument
+                bb.func().get_param_op(*idx)
+            }
+            PassMode::Pair(arg_attributes, arg_attributes1) => todo!(),
+            PassMode::Cast { pad_i32, ref cast } => todo!(),
+            PassMode::Indirect {
+                attrs,
+                meta_attrs,
+                on_stack,
+            } => todo!(),
+        };
+
+        let op = stmt.alloc_op();
+        op.mk_store_addr(addr, value);
     }
 
     fn store_arg(
         &mut self,
-        arg_abi: &rustc_target::callconv::ArgAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
+        arg_abi: &ArgAbi<'tcx, Ty<'tcx>>,
         val: Self::Value,
-        dst: rustc_codegen_ssa::mir::place::PlaceRef<'tcx, Self::Value>,
+        dst: PlaceRef<'tcx, Self::Value>,
     ) {
+        // store argument to pass to function, ie we are caller/sender
         todo!()
     }
 
-    fn arg_memory_ty(
-        &self,
-        arg_abi: &rustc_target::callconv::ArgAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
-    ) -> Self::Type {
+    fn arg_memory_ty(&self, arg_abi: &ArgAbi<'tcx, Ty<'tcx>>) -> Self::Type {
         todo!()
     }
 }
 
-impl<'tcx> DebugInfoBuilderMethods for Builder<'tcx> {
+impl<'a, 'tcx> DebugInfoBuilderMethods for Builder<'a, 'tcx> {
     fn dbg_var_addr(
         &mut self,
         dbg_var: Self::DIVariable,
@@ -156,7 +184,7 @@ impl<'tcx> DebugInfoBuilderMethods for Builder<'tcx> {
         indirect_offsets: &[rustc_abi::Size],
         // Byte range in the `dbg_var` covered by this fragment,
         // if this is a fragment of a composite `DIVariable`.
-        fragment: Option<std::ops::Range<rustc_abi::Size>>,
+        fragment: Option<Range<rustc_abi::Size>>,
     ) {
         todo!()
     }
@@ -182,17 +210,13 @@ impl<'tcx> DebugInfoBuilderMethods for Builder<'tcx> {
     }
 }
 
-impl<'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'tcx> {
-    fn add_coverage(
-        &mut self,
-        instance: rustc_middle::ty::Instance<'tcx>,
-        kind: &rustc_middle::mir::coverage::CoverageKind,
-    ) {
+impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+    fn add_coverage(&mut self, instance: Instance<'tcx>, kind: &CoverageKind) {
         todo!()
     }
 }
 
-impl<'tcx> Deref for Builder<'tcx> {
+impl<'a, 'tcx> Deref for Builder<'a, 'tcx> {
     type Target = CodegenCx<'tcx>;
 
     fn deref(&self) -> &Self::Target {
@@ -200,63 +224,67 @@ impl<'tcx> Deref for Builder<'tcx> {
     }
 }
 
-impl<'tcx> LayoutOfHelpers<'tcx> for Builder<'tcx> {
-    type LayoutOfResult = rustc_middle::ty::layout::TyAndLayout<'tcx>;
+impl<'a, 'tcx> LayoutOfHelpers<'tcx> for Builder<'a, 'tcx> {
+    type LayoutOfResult = TyAndLayout<'tcx>;
 
     fn handle_layout_err(
         &self,
-        err: rustc_middle::ty::layout::LayoutError<'tcx>,
+        err: LayoutError<'tcx>,
         span: rustc_span::Span,
-        ty: rustc_middle::ty::Ty<'tcx>,
-    ) -> <Self::LayoutOfResult as rustc_middle::ty::layout::MaybeResult<
-        rustc_middle::ty::layout::TyAndLayout<'tcx>,
-    >>::Error {
+        ty: Ty<'tcx>,
+    ) -> <Self::LayoutOfResult as MaybeResult<TyAndLayout<'tcx>>>::Error {
         todo!()
     }
 }
 
-impl<'tcx> HasDataLayout for Builder<'tcx> {
-    fn data_layout(&self) -> &rustc_abi::TargetDataLayout {
+impl<'a, 'tcx> HasDataLayout for Builder<'a, 'tcx> {
+    fn data_layout(&self) -> &TargetDataLayout {
         todo!()
     }
 }
 
-impl<'tcx> HasTyCtxt<'tcx> for Builder<'tcx> {
-    fn tcx(&self) -> rustc_middle::ty::TyCtxt<'tcx> {
-        self.cx.tcx()
+impl<'a, 'tcx> HasTyCtxt<'tcx> for Builder<'a, 'tcx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.cx.tcx
     }
 }
 
-impl<'tcx> HasTypingEnv<'tcx> for Builder<'tcx> {
-    fn typing_env(&self) -> rustc_middle::ty::TypingEnv<'tcx> {
-        todo!()
+impl<'a, 'tcx> HasTypingEnv<'tcx> for Builder<'a, 'tcx> {
+    fn typing_env(&self) -> TypingEnv<'tcx> {
+        TypingEnv::fully_monomorphized()
     }
 }
 
-impl<'tcx> FnAbiOfHelpers<'tcx> for Builder<'tcx> {
-    type FnAbiOfResult = &'tcx rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>;
+impl<'a, 'tcx> Builder<'a, 'tcx> {
+    fn alloc_next_op(&self) -> IrOp {
+        let bb = self.cur_bb.borrow().unwrap();
+        let stmt = bb.alloc_stmt();
+        stmt.alloc_op()
+    }
+}
+
+impl<'a, 'tcx> FnAbiOfHelpers<'tcx> for Builder<'a, 'tcx> {
+    type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
 
     fn handle_fn_abi_err(
         &self,
-        err: rustc_middle::ty::layout::FnAbiError<'tcx>,
+        err: FnAbiError<'tcx>,
         span: rustc_span::Span,
-        fn_abi_request: rustc_middle::ty::layout::FnAbiRequest<'tcx>,
-    ) -> <Self::FnAbiOfResult as rustc_middle::ty::layout::MaybeResult<
-        &'tcx rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
-    >>::Error {
+        fn_abi_request: FnAbiRequest<'tcx>,
+    ) -> <Self::FnAbiOfResult as MaybeResult<&'tcx FnAbi<'tcx, Ty<'tcx>>>>::Error {
         todo!()
     }
 }
 
-impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
+impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     type CodegenCx = CodegenCx<'tcx>;
 
     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self {
-        todo!()
+        Builder::with_cx(cx)
     }
 
     fn cx(&self) -> &Self::CodegenCx {
-        todo!()
+        &self.cx
     }
 
     fn llbb(&self) -> Self::BasicBlock {
@@ -264,31 +292,43 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
     }
 
     fn set_span(&mut self, span: rustc_span::Span) {
-        todo!()
+        // TODO: debug info
     }
 
     fn append_block(cx: &'a Self::CodegenCx, llfn: Self::Function, name: &str) -> Self::BasicBlock {
-        todo!()
+        let bb = llfn.alloc_basicblock();
+
+        *cx.cur_bb.borrow_mut() = Some(bb);
+
+        bb
     }
 
     fn append_sibling_block(&mut self, name: &str) -> Self::BasicBlock {
-        todo!()
+        let cur = &self.cx.cur_bb.borrow().unwrap();
+        let bb = cur.func().alloc_basicblock();
+
+        bb.comment(name.as_bytes());
+
+        bb
     }
 
     fn switch_to_block(&mut self, llbb: Self::BasicBlock) {
-        todo!()
+        *self.cur_bb.borrow_mut() = Some(llbb);
     }
 
     fn ret_void(&mut self) {
-        todo!()
+        let op = self.alloc_next_op();
+        op.mk_ret(None);
     }
 
     fn ret(&mut self, v: Self::Value) {
-        todo!()
+        let op = self.alloc_next_op();
+        op.mk_ret(None);
     }
 
     fn br(&mut self, dest: Self::BasicBlock) {
-        todo!()
+        let op = self.alloc_next_op();
+        op.mk_br(dest);
     }
 
     fn cond_br(
@@ -313,13 +353,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
         &mut self,
         llty: Self::Type,
         fn_attrs: Option<&rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs>,
-        fn_abi: Option<&rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
         then: Self::BasicBlock,
         catch: Self::BasicBlock,
         funclet: Option<&Self::Funclet>,
-        instance: Option<rustc_middle::ty::Instance<'tcx>>,
+        instance: Option<Instance<'tcx>>,
     ) -> Self::Value {
         todo!()
     }
@@ -463,7 +503,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
     fn checked_binop(
         &mut self,
         oop: rustc_codegen_ssa::traits::OverflowOp,
-        ty: rustc_middle::ty::Ty<'_>,
+        ty: Ty<'_>,
         lhs: Self::Value,
         rhs: Self::Value,
     ) -> (Self::Value, Self::Value) {
@@ -479,11 +519,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
     }
 
     fn alloca(&mut self, size: rustc_abi::Size, align: rustc_abi::Align) -> Self::Value {
-        todo!()
+        // HACK: we don't have "alloc size"
+        // only "alloc local"
+
+        let byte = self.unit.integer(IrIntTy::I8);
+        let sz = size.bytes_usize();
+        let ty = self.unit.array(&byte, sz);
+
+        let bb = self.cur_bb.borrow().unwrap();
+        let lcl = bb.func().add_local(ty);
+
+        // TODO: should we alloc new stmt here?
+        let op = self.alloc_next_op();
+        op.mk_addr_lcl(lcl);
+
+        op
     }
 
     fn dynamic_alloca(&mut self, size: Self::Value, align: rustc_abi::Align) -> Self::Value {
-        todo!()
+        todo!("dynamic alloca not supported")
     }
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: rustc_abi::Align) -> Self::Value {
@@ -506,7 +560,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
 
     fn load_operand(
         &mut self,
-        place: rustc_codegen_ssa::mir::place::PlaceRef<'tcx, Self::Value>,
+        place: PlaceRef<'tcx, Self::Value>,
     ) -> rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value> {
         todo!()
     }
@@ -515,7 +569,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
         &mut self,
         elem: rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value>,
         count: u64,
-        dest: rustc_codegen_ssa::mir::place::PlaceRef<'tcx, Self::Value>,
+        dest: PlaceRef<'tcx, Self::Value>,
     ) {
         todo!()
     }
@@ -795,11 +849,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'tcx> {
         &mut self,
         llty: Self::Type,
         fn_attrs: Option<&rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs>,
-        fn_abi: Option<&rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
-        instance: Option<rustc_middle::ty::Instance<'tcx>>,
+        instance: Option<Instance<'tcx>>,
     ) -> Self::Value {
         todo!()
     }
