@@ -5,6 +5,9 @@
 #![feature(ptr_as_ref_unchecked)]
 // #![warn(clippy::pedantic)]
 
+// TEMP: while impl
+#![allow(unused_variables)]
+
 //! rustc_codegen_jcc - a JCC-based backend for rust
 
 extern crate rustc_abi;

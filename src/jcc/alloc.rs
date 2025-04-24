@@ -1,22 +1,14 @@
 use std::{
     alloc::{AllocError, Allocator, Layout},
-    ffi::{CStr, CString, c_char},
-    fmt::{Debug, Formatter},
-    fs::File,
-    io,
-    mem::{self, MaybeUninit},
+    ffi::c_char,
+    mem::{self},
     ops::Deref,
-    os::{
-        fd::{AsFd, AsRawFd},
-        raw::c_void,
-        unix::ffi::OsStrExt,
-    },
+    os::unix::ffi::OsStrExt,
     path::Path,
     ptr::{self, NonNull},
     slice,
 };
 
-use rustc_ast::token::TokenKind::AndAnd;
 
 use crate::jcc_sys::*;
 

@@ -1,56 +1,41 @@
 use std::{
     cell::RefCell,
-    ffi::{self, CString},
-    mem,
     num::NonZeroUsize,
     ops::Range,
-    ptr,
 };
 
-use rustc_abi::{AddressSpace, FieldsShape, HasDataLayout, Primitive, Scalar, WrappingRange};
-use rustc_ast::token::NtPatKind::PatWithOr;
-use rustc_codegen_ssa::{
-    CrateInfo,
-    mono_item::MonoItemExt,
-    traits::{
-        AbiBuilderMethods, AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods,
-        ConstCodegenMethods, DebugInfoCodegenMethods, ExtraBackendMethods,
+use rustc_abi::{FieldsShape, HasDataLayout};
+use rustc_codegen_ssa::traits::{
+        AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods,
+        ConstCodegenMethods, DebugInfoCodegenMethods,
         LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
         StaticCodegenMethods, TypeMembershipCodegenMethods,
-    },
-};
+    };
 use rustc_const_eval::interpret::{
-    self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, Pointer, read_target_uint,
+    self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, read_target_uint,
 };
-use rustc_data_structures::{fx::FxHashMap, profiling::SelfProfilerRef};
-use rustc_metadata::EncodedMetadata;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::{
     bug,
-    mir::{
-        BasicBlock, BasicBlockData, Statement, StatementKind, TerminatorKind,
-        mono::{CodegenUnit, Linkage, MonoItem, Visibility},
-    },
+    mir::mono::{CodegenUnit, Linkage, Visibility},
     ty::{
-        self, EarlyBinder, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
+        self, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
         layout::{FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout},
     },
 };
 use rustc_session::Session;
-use rustc_span::{Symbol, def_id::DefId, sym::abi};
+use rustc_span::{Symbol, def_id::DefId};
 use rustc_target::callconv::{ArgAbi, CastTarget, FnAbi, PassMode};
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 use smallvec::{SmallVec, smallvec};
 
-use crate::{
-    jcc::{
+use crate::jcc::{
         alloc::{ArenaAlloc, ArenaAllocRef},
         ir::{
-            self, AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp,
+            AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp,
             IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
         },
-    },
-    jcc_sys::{self, IR_FUNC_FLAG_NONE},
-};
+    };
 
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -221,7 +206,7 @@ impl<'tcx> CodegenCx<'tcx> {
             }
         }
 
-        let mut next_offset = 0;
+        let next_offset = 0;
         for &(offset, prov) in alloc.provenance().ptrs().iter() {
             let offset = offset.bytes();
             assert_eq!(offset as usize as u64, offset);

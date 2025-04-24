@@ -30,7 +30,7 @@ use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 
 use crate::{
     CodegenCx, JccModule,
-    jcc::ir::{AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrFunc, IrIntTy, IrOp, IrVarTy},
+    jcc::ir::{AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrFunc, IrOp, IrVarTy},
 };
 
 pub struct Builder<'a, 'tcx> {

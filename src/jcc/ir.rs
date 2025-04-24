@@ -1,15 +1,9 @@
 use std::{
-    alloc::{AllocError, Allocator, Layout},
     ffi::{CString, c_char, c_int},
     fmt::{Debug, Formatter},
-    fs::File,
     io::{self, Stderr},
-    mem::{self, MaybeUninit},
     num::NonZeroUsize,
-    os::{
-        fd::{AsFd, AsRawFd, IntoRawFd},
-        raw::c_void,
-    },
+    os::fd::AsRawFd,
     ptr::{self, NonNull},
     slice,
 };

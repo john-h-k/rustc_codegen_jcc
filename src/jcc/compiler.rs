@@ -1,26 +1,14 @@
 use std::{
-    alloc::{AllocError, Allocator, Layout},
-    ffi::{CString, c_char},
-    fmt::{Debug, Formatter},
-    fs::File,
-    io,
-    mem::{self, MaybeUninit},
-    os::{
-        fd::{AsFd, AsRawFd},
-        raw::c_void,
-    },
     path::Path,
-    ptr::{self, NonNull},
-    slice,
+    ptr::{self},
 };
 
-use bitflags::bitflags;
 
 use crate::jcc_sys::*;
 
 use super::{
     alloc::ArenaAllocRef,
-    ir::{AsIrRaw, FromIrRaw, IrUnit},
+    ir::{AsIrRaw, IrUnit},
 };
 
 pub struct Compiler(*mut compiler);
