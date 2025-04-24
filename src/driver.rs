@@ -6,6 +6,7 @@ use std::{
 };
 
 use rustc_abi::HasDataLayout;
+use rustc_ast::token::NtPatKind::PatWithOr;
 use rustc_codegen_ssa::{
     CrateInfo,
     mono_item::MonoItemExt,
@@ -15,6 +16,7 @@ use rustc_codegen_ssa::{
         PreDefineCodegenMethods, StaticCodegenMethods, TypeMembershipCodegenMethods,
     },
 };
+use rustc_const_eval::interpret;
 use rustc_data_structures::{fx::FxHashMap, profiling::SelfProfilerRef};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
@@ -105,6 +107,14 @@ pub struct CodegenCx<'tcx> {
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrOp>>,
 
     pub cur_bb: RefCell<Option<IrBasicBlock>>,
+}
+
+impl<'tcx> CodegenCx<'tcx> {
+    pub fn alloc_next_op(&self) -> IrOp {
+        let bb = self.cur_bb.borrow().unwrap();
+        let stmt = bb.alloc_stmt();
+        stmt.alloc_op()
+    }
 }
 
 impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
@@ -336,7 +346,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        todo!()
+        ty_to_jcc_ty(self.tcx, &self.unit, &layout.ty)
     }
 
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
@@ -463,20 +473,27 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         todo!()
     }
 
-    fn const_data_from_alloc(
-        &self,
-        alloc: rustc_const_eval::interpret::ConstAllocation<'_>,
-    ) -> Self::Value {
+    fn const_data_from_alloc(&self, alloc: interpret::ConstAllocation<'_>) -> Self::Value {
         todo!()
     }
 
     fn scalar_to_backend(
         &self,
-        cv: rustc_const_eval::interpret::Scalar,
+        cv: interpret::Scalar,
         layout: rustc_abi::Scalar,
         llty: Self::Type,
     ) -> Self::Value {
-        todo!()
+        match cv {
+            interpret::Scalar::Int(scalar_int) => {
+                // TODO: handle properly
+                let value = scalar_int.to_bits_unchecked() as u64;
+
+                let op = self.alloc_next_op();
+                op.mk_cnst_int(llty, value);
+                op
+            }
+            interpret::Scalar::Ptr(pointer, _) => todo!(),
+        }
     }
 
     fn const_ptr_byte_offset(&self, val: Self::Value, offset: rustc_abi::Size) -> Self::Value {
@@ -630,19 +647,24 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         let glb = unit.add_global_def_func(fun_ty, symbol_name);
         let fun = glb.func();
 
-        let param_stmt = fun.mk_param_stmt();
-        for param in params {
-            if param.is_aggregate() {
-                let lcl = fun.add_local(param);
+        let bb = fun.alloc_basicblock();
+        if params.len() > 0 {
+            let param_stmt = fun.mk_param_stmt();
 
-                let op = param_stmt.alloc_op();
-                op.mk_lcl_param(param);
-            } else {
-                let op = param_stmt.alloc_op();
-                op.mk_mov_param(param);
+            for param in params {
+                if param.is_aggregate() {
+                    let lcl = fun.add_local(param);
+
+                    let op = param_stmt.alloc_op();
+                    op.mk_lcl_param(param);
+                } else {
+                    let op = param_stmt.alloc_op();
+                    op.mk_mov_param(param);
+                }
             }
         }
 
+        *self.cur_bb.borrow_mut() = Some(bb);
         self.fn_map.borrow_mut().insert(instance, glb);
     }
 }
@@ -660,137 +682,6 @@ impl<'tcx> CodegenCx<'tcx> {
             vtables,
             cur_bb: RefCell::new(None),
         }
-    }
-
-    pub(crate) fn codegen_stmt(&mut self, inst: &Instance<'tcx>, stmt: &Statement<'tcx>) {
-        match &stmt.kind {
-            StatementKind::Assign(assg) => {
-                let (place, value) = assg.as_ref();
-            }
-            StatementKind::SetDiscriminant {
-                place,
-                variant_index,
-            } => todo!(),
-            StatementKind::Deinit(place) => todo!(),
-            StatementKind::Intrinsic(non_diverging_intrinsic) => todo!(),
-            _ => {}
-        }
-    }
-
-    pub(crate) fn codegen_basic_block(
-        &mut self,
-        inst: &Instance<'tcx>,
-        fun: *mut jcc_sys::ir_func,
-        jcc_blocks: &[*mut jcc_sys::ir_basicblock],
-        idx: usize,
-        block: &BasicBlockData<'tcx>,
-    ) {
-        let jcc_bb = jcc_blocks[idx];
-
-        for stmt in block.statements.iter() {
-            self.codegen_stmt(inst, stmt);
-        }
-
-        let terminator = block.terminator();
-        match &terminator.kind {
-            TerminatorKind::Goto { target } => {
-                let to = jcc_blocks[target.index()];
-                unsafe {
-                    jcc_sys::ir_make_basicblock_merge(fun, jcc_bb, to);
-
-                    let stmt = jcc_sys::ir_alloc_stmt(fun, jcc_bb);
-                    let op = jcc_sys::ir_append_op(
-                        fun,
-                        stmt,
-                        jcc_sys::IR_OP_TY_BR,
-                        jcc_sys::IR_VAR_TY_NONE,
-                    );
-                }
-            }
-            TerminatorKind::SwitchInt { discr, targets } => todo!(),
-            TerminatorKind::Return => unsafe {
-                (*jcc_bb).ty = jcc_sys::IR_BASICBLOCK_TY_RET;
-                let stmt = jcc_sys::ir_alloc_stmt(fun, jcc_bb);
-                let op = jcc_sys::ir_append_op(
-                    fun,
-                    stmt,
-                    jcc_sys::IR_OP_TY_RET,
-                    jcc_sys::IR_VAR_TY_NONE,
-                );
-
-                (*op)._1.ret = jcc_sys::ir_op_ret {
-                    ..Default::default()
-                };
-            },
-            TerminatorKind::Unreachable => todo!(),
-            TerminatorKind::UnwindResume => todo!(),
-            TerminatorKind::UnwindTerminate(unwind_terminate_reason) => todo!(),
-            TerminatorKind::Drop {
-                place,
-                target,
-                unwind,
-                replace,
-            } => todo!(),
-            TerminatorKind::Call {
-                func,
-                args,
-                destination,
-                target,
-                unwind,
-                call_source,
-                fn_span,
-            } => {
-                // FIXME: we create too many BBs as JCC does not have bb for this
-                {
-                    let target = func;
-                    dbg!(&target);
-                }
-
-                if let Some(target) = target {
-                    let to = jcc_blocks[target.index()];
-                    unsafe {
-                        jcc_sys::ir_make_basicblock_merge(fun, jcc_bb, to);
-
-                        let stmt = jcc_sys::ir_alloc_stmt(fun, jcc_bb);
-                        let op = jcc_sys::ir_append_op(
-                            fun,
-                            stmt,
-                            jcc_sys::IR_OP_TY_BR,
-                            jcc_sys::IR_VAR_TY_NONE,
-                        );
-                    }
-                }
-            }
-            TerminatorKind::TailCall {
-                func,
-                args,
-                fn_span,
-            } => todo!(),
-            TerminatorKind::Assert {
-                cond,
-                expected,
-                msg,
-                target,
-                unwind,
-            } => todo!(),
-            TerminatorKind::InlineAsm {
-                asm_macro,
-                template,
-                operands,
-                options,
-                line_spans,
-                targets,
-                unwind,
-            } => todo!(),
-            _ => unreachable!(),
-        }
-    }
-
-    pub(crate) fn codegen_static(&mut self, def_id: &DefId) {
-        let const_val = self
-            .tcx
-            .eval_static_initializer(def_id)
-            .expect("eval_static_initializer failed");
     }
 
     pub(crate) fn module(&self) -> JccModule {

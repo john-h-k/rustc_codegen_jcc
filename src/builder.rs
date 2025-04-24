@@ -23,7 +23,7 @@ use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 
 use crate::{
     CodegenCx, JccModule,
-    jcc::ir::{IrBasicBlock, IrFunc, IrIntTy, IrOp, IrVarTy},
+    jcc::ir::{HasNext, IrBasicBlock, IrBasicBlockTy, IrFunc, IrIntTy, IrOp, IrVarTy},
 };
 
 pub struct Builder<'a, 'tcx> {
@@ -255,14 +255,6 @@ impl<'a, 'tcx> HasTypingEnv<'tcx> for Builder<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Builder<'a, 'tcx> {
-    fn alloc_next_op(&self) -> IrOp {
-        let bb = self.cur_bb.borrow().unwrap();
-        let stmt = bb.alloc_stmt();
-        stmt.alloc_op()
-    }
-}
-
 impl<'a, 'tcx> FnAbiOfHelpers<'tcx> for Builder<'a, 'tcx> {
     type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
 
@@ -296,10 +288,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn append_block(cx: &'a Self::CodegenCx, llfn: Self::Function, name: &str) -> Self::BasicBlock {
+        // if only one bb, it is param block, keep using it
+        let first = llfn.first();
+        if let Some(first) = first
+            && first.next().is_none()
+        {
+            return first;
+        }
+
         let bb = llfn.alloc_basicblock();
 
         *cx.cur_bb.borrow_mut() = Some(bb);
 
+        bb.comment(name.as_bytes());
         bb
     }
 
@@ -308,7 +309,6 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let bb = cur.func().alloc_basicblock();
 
         bb.comment(name.as_bytes());
-
         bb
     }
 
@@ -322,13 +322,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn ret(&mut self, v: Self::Value) {
+        let bb = self.cur_bb.borrow().unwrap();
+        bb.mk_ty(IrBasicBlockTy::Ret);
+
         let op = self.alloc_next_op();
-        op.mk_ret(None);
+        op.mk_ret(Some(v));
     }
 
     fn br(&mut self, dest: Self::BasicBlock) {
+        let bb = self.cur_bb.borrow().unwrap();
+        bb.mk_ty(IrBasicBlockTy::Merge { target: dest });
+
         let op = self.alloc_next_op();
-        op.mk_br(dest);
+        op.mk_br();
     }
 
     fn cond_br(
@@ -337,7 +343,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         then_llbb: Self::BasicBlock,
         else_llbb: Self::BasicBlock,
     ) {
-        todo!()
+        let bb = self.cur_bb.borrow().unwrap();
+        bb.mk_ty(IrBasicBlockTy::Split {
+            true_target: then_llbb,
+            false_target: else_llbb,
+        });
+
+        let op = self.alloc_next_op();
+        op.mk_cond_br(cond);
     }
 
     fn switch(

@@ -409,7 +409,41 @@ impl IrFunc {
     }
 }
 
+pub enum IrBasicBlockTy {
+    Ret,
+    Merge {
+        target: IrBasicBlock,
+    },
+    Split {
+        true_target: IrBasicBlock,
+        false_target: IrBasicBlock,
+    },
+}
+
 impl IrBasicBlock {
+    pub fn mk_ty(&self, ty: IrBasicBlockTy) {
+        let f = self.func().as_mut_ptr();
+        let p = self.as_mut_ptr();
+
+        unsafe {
+            match ty {
+                IrBasicBlockTy::Ret => ir_make_basicblock_ret(f, p),
+                IrBasicBlockTy::Merge { target } => {
+                    ir_make_basicblock_merge(f, p, target.as_mut_ptr())
+                }
+                IrBasicBlockTy::Split {
+                    true_target,
+                    false_target,
+                } => ir_make_basicblock_split(
+                    f,
+                    p,
+                    true_target.as_mut_ptr(),
+                    false_target.as_mut_ptr(),
+                ),
+            }
+        }
+    }
+
     pub fn comment(&self, comment: &[u8]) {
         let comment = self.func().arena().alloc_str(comment);
 
@@ -548,15 +582,27 @@ impl IrOp {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         unsafe {
+            let value = value.as_mut_ptr();
+
             p.ty = IR_OP_TY_RET;
             p.var_ty = IR_VAR_TY_NONE;
-            p._1.ret = ir_op_ret {
-                value: value.as_mut_ptr(),
+            p._1.ret = ir_op_ret { value };
+        }
+    }
+
+    pub fn mk_cond_br(&self, cond: IrOp) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        unsafe {
+            p.ty = IR_OP_TY_BR_COND;
+            p.var_ty = IR_VAR_TY_NONE;
+            p._1.br_cond = ir_op_br_cond {
+                cond: cond.as_mut_ptr(),
             };
         }
     }
 
-    pub fn mk_br(&self, _target: IrBasicBlock) {
+    pub fn mk_br(&self) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         unsafe {
@@ -593,6 +639,28 @@ impl IrOp {
         p.flags |= IR_OP_FLAG_PARAM;
         p._1.mov = ir_op_mov {
             value: ptr::null_mut(),
+        };
+    }
+
+    pub fn mk_cnst_int(&self, IrVarTy(var_ty): IrVarTy, value: u64) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_CNST;
+        p.var_ty = var_ty;
+        p._1.cnst = ir_op_cnst {
+            ty: IR_OP_CNST_TY_INT,
+            _1: ir_op_cnst__bindgen_ty_1 { int_value: value },
+        };
+    }
+
+    pub fn mk_cnst_float(&self, IrVarTy(var_ty): IrVarTy, value: f64) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_CNST;
+        p.var_ty = var_ty;
+        p._1.cnst = ir_op_cnst {
+            ty: IR_OP_CNST_TY_FLT,
+            _1: ir_op_cnst__bindgen_ty_1 { flt_value: value },
         };
     }
 
