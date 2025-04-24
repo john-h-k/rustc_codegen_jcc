@@ -1,16 +1,11 @@
-use std::{
-    cell::RefCell,
-    num::NonZeroUsize,
-    ops::Range,
-};
+use std::{cell::RefCell, num::NonZeroUsize, ops::Range};
 
 use rustc_abi::{FieldsShape, HasDataLayout};
 use rustc_codegen_ssa::traits::{
-        AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods,
-        ConstCodegenMethods, DebugInfoCodegenMethods,
-        LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
-        StaticCodegenMethods, TypeMembershipCodegenMethods,
-    };
+    AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods, ConstCodegenMethods,
+    DebugInfoCodegenMethods, LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
+    StaticCodegenMethods, TypeMembershipCodegenMethods,
+};
 use rustc_const_eval::interpret::{
     self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, read_target_uint,
 };
@@ -30,12 +25,12 @@ use rustc_type_ir::{FloatTy, IntTy, UintTy};
 use smallvec::{SmallVec, smallvec};
 
 use crate::jcc::{
-        alloc::{ArenaAlloc, ArenaAllocRef},
-        ir::{
-            AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp,
-            IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
-        },
-    };
+    alloc::{ArenaAlloc, ArenaAllocRef},
+    ir::{
+        AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp, IrUnit,
+        IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
+    },
+};
 
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -60,7 +55,7 @@ fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, unit: &IrUnit, ty: &TyAndLayout<'tcx>) 
 
     match ty.kind() {
         TyKind::Never => unit.var_ty_none(),
-        TyKind::Tuple(tys) if tys.len() == 0 => unit.var_ty_none(),
+        TyKind::Tuple(tys) if tys.is_empty() => unit.var_ty_none(),
         TyKind::Bool => unit.var_ty_integer(IrIntTy::I1),
         TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => unit.var_ty_integer(IrIntTy::I8),
         TyKind::Char => unit.var_ty_integer(IrIntTy::I32),
@@ -206,7 +201,7 @@ impl<'tcx> CodegenCx<'tcx> {
             }
         }
 
-        let next_offset = 0;
+        let mut next_offset = 0;
         for &(offset, prov) in alloc.provenance().ptrs().iter() {
             let offset = offset.bytes();
             assert_eq!(offset as usize as u64, offset);
@@ -236,7 +231,6 @@ impl<'tcx> CodegenCx<'tcx> {
 
             let address_space = self.tcx.global_alloc(prov.alloc_id()).address_space(self);
 
-            todo!("ptr relocs");
             // self.scalar_to_var_value(
             //     interpret::Scalar::from_pointer(
             //         Pointer::new(prov, rustc_abi::Size::from_bytes(ptr_offset)),
@@ -250,6 +244,7 @@ impl<'tcx> CodegenCx<'tcx> {
             // );
 
             next_offset = offset + pointer_size;
+            todo!("ptr relocs");
         }
 
         if alloc.len() >= next_offset {
@@ -455,7 +450,7 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn sess(&self) -> &Session {
-        &self.tcx.sess
+        self.tcx.sess
     }
 
     fn codegen_unit(&self) -> &'tcx CodegenUnit<'tcx> {
@@ -503,16 +498,16 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
-        match layout.ty.kind() {
+        matches!(
+            layout.ty.kind(),
             TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(..)
-            | TyKind::Uint(..)
-            | TyKind::Float(..)
-            | TyKind::RawPtr(..)
-            | TyKind::Ref(..) => true,
-            _ => false,
-        }
+                | TyKind::Char
+                | TyKind::Int(..)
+                | TyKind::Uint(..)
+                | TyKind::Float(..)
+                | TyKind::RawPtr(..)
+                | TyKind::Ref(..)
+        )
     }
 
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool {
@@ -832,14 +827,14 @@ impl<'tcx> CodegenCx<'tcx> {
             PassMode::Pair(arg_attributes, arg_attributes1) => {
                 let Some(IrVarTyAggregate {
                     ty: IrVarTyAggregateTy::Struct,
-                    fields: &[_0, _1],
+                    fields: fields @ [_, _],
                     ..
                 }) = ty.aggregate()
                 else {
                     bug!("expected Pair to be struct aggregate with two fields");
                 };
 
-                smallvec![_0, _1]
+                SmallVec::from_slice(fields)
             }
             PassMode::Cast { pad_i32, cast } => todo!(),
             PassMode::Indirect {
@@ -884,9 +879,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
 
         // FIXME: variadic flag for variadic fn
-        let fun_ty = self
-            .unit
-            .var_ty_func(&params[..], &ret, IrVarTyFuncFlags::None);
+        let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
 
         // TODO: visibility
         if self.tcx.is_foreign_item(instance.def_id()) {
@@ -942,7 +935,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             // FIXME: recompute params in `declare_fn` and here
             let bb = fun.alloc_basicblock();
 
-            if params.len() > 0 {
+            if !params.is_empty() {
                 let param_stmt = fun.mk_param_stmt();
 
                 for param in params {

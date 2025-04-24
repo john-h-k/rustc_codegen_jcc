@@ -6,6 +6,7 @@
 // #![warn(clippy::pedantic)]
 
 // TEMP: while impl
+#![allow(dead_code)]
 #![allow(unused_variables)]
 
 //! rustc_codegen_jcc - a JCC-based backend for rust
@@ -38,10 +39,7 @@ mod jcc_sys;
 
 use builder::Builder;
 use driver::{CodegenCx, JccModule};
-use jcc::{
-    alloc::ArenaAlloc,
-    compiler::Compiler,
-};
+use jcc::{alloc::ArenaAlloc, compiler::Compiler};
 use rustc_ast::expand::{allocator::AllocatorKind, autodiff_attrs::AutoDiffItem};
 use rustc_codegen_ssa::{
     CodegenResults, CompiledModule, ModuleCodegen,
@@ -54,8 +52,8 @@ use rustc_codegen_ssa::{
     },
     mono_item::MonoItemExt,
     traits::{
-        CodegenBackend, ExtraBackendMethods, ModuleBufferMethods,
-        ThinBufferMethods, WriteBackendMethods,
+        CodegenBackend, ExtraBackendMethods, ModuleBufferMethods, ThinBufferMethods,
+        WriteBackendMethods,
     },
 };
 
@@ -73,9 +71,7 @@ use rustc_session::{
 };
 use rustc_span::{Symbol, sym};
 
-use std::{
-    any::Any, os::unix::ffi::OsStringExt, sync::Arc,
-};
+use std::{any::Any, sync::Arc};
 
 #[derive(Clone)]
 struct JccCodegenBackend;

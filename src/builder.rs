@@ -231,7 +231,7 @@ impl<'a, 'tcx> Deref for Builder<'a, 'tcx> {
     type Target = CodegenCx<'tcx>;
 
     fn deref(&self) -> &Self::Target {
-        &self.cx
+        self.cx
     }
 }
 
@@ -287,7 +287,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn cx(&self) -> &Self::CodegenCx {
-        &self.cx
+        self.cx
     }
 
     fn llbb(&self) -> Self::BasicBlock {
@@ -616,7 +616,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             )
         } else if let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr {
             let b_offset = a.size(self).align_to(b.align(self).abi);
-            let mut load = |i, scalar: &rustc_abi::Scalar, align| {
+            let load = |i: i32, scalar: &rustc_abi::Scalar, align: usize| {
                 let llptr = if i == 0 {
                     place.val.llval
                 } else {
@@ -632,10 +632,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 //     load
                 // }
             };
-            OperandValue::Pair(
-                load(0, a, place.val.align),
-                load(1, b, place.val.align.restrict_for_offset(b_offset)),
-            );
+            // OperandValue::Pair(
+            //     load(0, a, place.val.align),
+            //     load(1, b, place.val.align.restrict_for_offset(b_offset))
+            // );
             todo!("pairs")
         } else {
             OperandValue::Ref(place.val)

@@ -44,7 +44,7 @@ impl ArenaAlloc {
 
 impl AsRef<ArenaAllocRef> for ArenaAlloc {
     fn as_ref(&self) -> &ArenaAllocRef {
-        &self
+        self
     }
 }
 
@@ -107,7 +107,7 @@ impl ArenaAllocRef {
     }
 
     pub fn alloc_slice_copy<T>(&self, slice: &[T]) -> *mut T {
-        if slice.len() == 0 {
+        if slice.is_empty() {
             return NonNull::dangling().as_ptr();
         }
 

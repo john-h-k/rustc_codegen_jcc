@@ -56,7 +56,7 @@ impl<T> Drop for OwnedCFile<T> {
 
 impl Debug for ir_object {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "")?;
+        writeln!(f)?;
         let stderr = OwnedCFile::stderr();
         unsafe {
             debug_print_ir_object(stderr.ptr, self);
@@ -372,9 +372,7 @@ impl<'a, Parent, T: Copy + FromIrRaw + HasNext> Iterator for IterFunc<'a, Parent
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(cur) = self.cur else {
-            return None;
-        };
+        let cur = self.cur?;
 
         self.cur = cur.next();
         Some(cur)
@@ -868,7 +866,7 @@ impl IrOp {
         }
         p._1.mem_set = ir_op_mem_set {
             addr: addr.as_mut_ptr(),
-            value: value.into(),
+            value,
             length,
         };
     }
@@ -1121,10 +1119,9 @@ impl IrVarTy {
     // const F128: Self = Self(unsafe { IR_VAR_TY_F128 });
 
     pub fn aggregate(&self) -> Option<IrVarTyAggregate> {
-        let ty;
-        match self.0.ty {
-            IR_VAR_TY_TY_STRUCT => ty = IrVarTyAggregateTy::Struct,
-            IR_VAR_TY_TY_UNION => ty = IrVarTyAggregateTy::Union,
+        let ty = match self.0.ty {
+            IR_VAR_TY_TY_STRUCT => IrVarTyAggregateTy::Struct,
+            IR_VAR_TY_TY_UNION => IrVarTyAggregateTy::Union,
             _ => return None,
         };
 
@@ -1140,23 +1137,17 @@ impl IrVarTy {
     }
 
     pub fn is_aggregate(&self) -> bool {
-        match self.0.ty {
-            IR_VAR_TY_TY_STRUCT | IR_VAR_TY_TY_UNION => true,
-            _ => false,
-        }
+        matches!(self.0.ty, IR_VAR_TY_TY_STRUCT | IR_VAR_TY_TY_UNION)
     }
 
     pub fn is_array(&self) -> bool {
-        match self.0.ty {
-            IR_VAR_TY_TY_ARRAY => true,
-            _ => false,
-        }
+        matches!(self.0.ty, IR_VAR_TY_TY_ARRAY)
     }
 }
 
 impl Debug for IrVarTy {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "")?;
+        writeln!(f)?;
         let stderr = OwnedCFile::stderr();
         unsafe {
             debug_print_var_ty_string(stderr.ptr, &self.0);
