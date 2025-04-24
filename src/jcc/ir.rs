@@ -100,6 +100,8 @@ pub struct IrUnit {
     ptr: NonNull<ir_unit>,
 }
 
+unsafe impl Sync for ir_var_ty {}
+
 impl IrUnit {
     pub fn new(arena: ArenaAllocRef) -> Self {
         let unit = ir_unit {
@@ -114,27 +116,55 @@ impl IrUnit {
         Self { ptr }
     }
 
+    pub fn var_ty_info(&self, var_ty: IrVarTy) -> IrVarTyInfo {
+        let info = unsafe { ir_var_ty_info(self.as_mut_ptr(), &var_ty.0) };
+
+        IrVarTyInfo {
+            size: info.size,
+            alignment: info.alignment,
+        }
+    }
+
     fn mk_arena(&self) -> ArenaAllocRef {
         ArenaAllocRef::from_raw(unsafe { self.ptr.as_ref().arena })
     }
 
-    pub fn none(&self) -> IrVarTy {
+    pub fn var_ty_none(&self) -> IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_NONE })
     }
 
-    pub fn pointer(&self) -> IrVarTy {
+    pub fn var_ty_pointer(&self) -> IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_POINTER })
     }
 
-    pub fn bytes(&self, size: usize) -> IrVarTy {
-        self.array(&self.integer(IrIntTy::I8), size)
+    pub fn var_ty_fat_pointer(&self) -> IrVarTy {
+        // TODO: cache
+        let fields = unsafe { [IR_VAR_TY_POINTER, IR_VAR_TY_POINTER] };
+        let num_fields = fields.len();
+        let fields = self.mk_arena().alloc_slice_copy(&fields);
+
+        IrVarTy(ir_var_ty {
+            ty: IR_VAR_TY_TY_STRUCT,
+            _1: ir_var_ty__bindgen_ty_1 {
+                aggregate: ir_var_aggregate_ty { fields, num_fields },
+            },
+        })
     }
 
-    pub fn array(&self, IrVarTy(el): &IrVarTy, len: usize) -> IrVarTy {
+    pub fn var_ty_bytes(&self, size: usize) -> IrVarTy {
+        self.var_ty_array(&self.var_ty_integer(IrIntTy::I8), size)
+    }
+
+    pub fn var_ty_array(&self, IrVarTy(el): &IrVarTy, len: usize) -> IrVarTy {
         IrVarTy(unsafe { ir_var_ty_make_array(self.ptr.as_ref(), el, len) })
     }
 
-    pub fn func(&self, params: &[IrVarTy], ret: &IrVarTy, flags: IrVarTyFuncFlags) -> IrVarTy {
+    pub fn var_ty_func(
+        &self,
+        params: &[IrVarTy],
+        ret: &IrVarTy,
+        flags: IrVarTyFuncFlags,
+    ) -> IrVarTy {
         let arena = self.mk_arena();
         let params_ptr = arena.alloc_slice_copy(params);
         let ret_ptr = arena.alloc_copy(ret);
@@ -156,7 +186,7 @@ impl IrUnit {
         })
     }
 
-    pub fn integer(&self, ty: IrIntTy) -> IrVarTy {
+    pub fn var_ty_integer(&self, ty: IrIntTy) -> IrVarTy {
         IrVarTy(unsafe {
             match ty {
                 IrIntTy::I1 => IR_VAR_TY_I1,
@@ -169,7 +199,7 @@ impl IrUnit {
         })
     }
 
-    pub fn float(&self, ty: IrFloatTy) -> IrVarTy {
+    pub fn var_ty_float(&self, ty: IrFloatTy) -> IrVarTy {
         IrVarTy(unsafe {
             match ty {
                 IrFloatTy::F16 => IR_VAR_TY_F16,
@@ -222,6 +252,7 @@ pub trait FromIrRaw: AsIrRaw {
 macro_rules! ir_object_newtype {
     ($t:ident, $ty:ty, $obj:ident, $name:ident) => {
         #[derive(Clone, Copy, PartialEq, Eq)]
+        #[repr(transparent)]
         pub struct $t(NonNull<$ty>);
 
         impl AsIrRaw for $t {
@@ -287,6 +318,12 @@ ir_object_newtype!(IrStmt, ir_stmt, IR_OBJECT_TY_STMT, stmt);
 ir_object_newtype!(IrOp, ir_op, IR_OBJECT_TY_OP, op);
 
 impl IrGlb {
+    pub fn is_def(&self) -> bool {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.def_ty == IR_GLB_DEF_TY_DEFINED
+    }
+
     pub fn var(&self) -> IrVar {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
@@ -407,7 +444,7 @@ impl IrVar {
         let num_values = bytes.len();
 
         for chunk in bytes {
-            let ty = unit.bytes(chunk.bytes.len());
+            let ty = unit.var_ty_bytes(chunk.bytes.len());
 
             offsets.push(chunk.offset);
             values.push(ir_var_value {
@@ -478,6 +515,7 @@ impl IrFunc {
     }
 
     pub fn get_param_op(&self, idx: usize) -> IrOp {
+        dbg!(&self);
         // FIXME: more efficient way to do this (JCC should probably have better UX here, probably a `ir_get_param_stmt` fn
         let stmt = self
             .first()
@@ -660,6 +698,11 @@ impl AddrOffset {
 }
 
 impl IrOp {
+    pub fn var_ty(&self) -> IrVarTy {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        IrVarTy(p.var_ty)
+    }
+
     pub fn stmt(&self) -> IrStmt {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrStmt::from_raw(p.stmt)
@@ -673,6 +716,32 @@ impl IrOp {
     pub fn func(&self) -> IrFunc {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe { IrFunc::from_raw((*(*p.stmt).basicblock).func) }
+    }
+
+    pub fn mk_call(&self, func_ty: IrVarTy, target: IrOp, args: &[IrOp], ret: IrVarTy) {
+        unsafe {
+            (*self.func().as_mut_ptr()).flags |= IR_FUNC_FLAG_MAKES_CALL;
+        }
+
+        let arena = self.func().unit().mk_arena();
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        let num_args = args.len();
+        let args = arena.alloc_slice_copy(args);
+        // SAFETY: repr(transparent)
+        let args = args.cast::<*mut ir_op>();
+
+        p.ty = IR_OP_TY_CALL;
+        p.var_ty = ret.0;
+        p._1.call = ir_op_call {
+            func_ty: func_ty.0,
+            target: target.as_mut_ptr(),
+            num_args,
+            args,
+            arg_var_tys: ptr::null_mut(),
+
+            ..Default::default()
+        };
     }
 
     pub fn mk_ret(&self, value: Option<IrOp>) {
@@ -792,6 +861,27 @@ impl IrOp {
         }
     }
 
+    fn chk_ty(&self) -> u32 {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        p.ty
+    }
+
+    pub fn get_addr_glb(&self) -> Option<IrGlb> {
+        let IR_OP_TY_ADDR = self.chk_ty() else {
+            return None;
+        };
+
+        unsafe {
+            let p = self.0.as_ptr().as_mut_unchecked();
+            let addr = p._1.addr;
+
+            match addr.ty {
+                IR_OP_ADDR_TY_GLB => Some(IrGlb::from_raw(addr._1.glb)),
+                _ => None,
+            }
+        }
+    }
+
     pub fn mk_addr_lcl(&self, lcl: IrLcl) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
@@ -859,6 +949,25 @@ impl IrUnit {
         }
     }
 
+    pub fn add_global_undef_func(&self, IrVarTy(var_ty): IrVarTy, name: &str) -> IrGlb {
+        unsafe {
+            let arena = self.mk_arena();
+            let name = arena.alloc_str(name);
+
+            let unit = self.ptr.as_ptr().as_mut_unchecked();
+
+            debug_assert!(var_ty.ty == IR_VAR_TY_TY_FUNC, "expected func ty");
+
+            let glb = ir_add_global(unit, IR_GLB_TY_FUNC, &var_ty, IR_GLB_DEF_TY_UNDEFINED, name);
+
+            // TODO: linkage
+            (*glb).linkage = IR_LINKAGE_EXTERNAL;
+            (*glb)._1.func = ptr::null_mut();
+
+            IrGlb(NonNull::new(glb).unwrap())
+        }
+    }
+
     pub fn add_global_def_func(&self, IrVarTy(var_ty): IrVarTy, name: &str) -> IrGlb {
         unsafe {
             let arena = self.mk_arena();
@@ -866,12 +975,13 @@ impl IrUnit {
 
             let unit = self.ptr.as_ptr().as_mut_unchecked();
 
+            debug_assert!(var_ty.ty == IR_VAR_TY_TY_FUNC, "expected func ty");
+
             let glb = ir_add_global(unit, IR_GLB_TY_FUNC, &var_ty, IR_GLB_DEF_TY_DEFINED, name);
 
+            // TODO: linkage
             (*glb).linkage = IR_LINKAGE_EXTERNAL;
             (*glb)._1.func = arena.alloc::<ir_func>();
-
-            debug_assert!(var_ty.ty == IR_VAR_TY_TY_FUNC, "expected func ty");
 
             *(*glb)._1.func = ir_func {
                 unit,
@@ -887,9 +997,25 @@ impl IrUnit {
     }
 }
 
+// TODO: expensive, take ref in more places
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct IrVarTy(ir_var_ty);
+
+pub enum IrVarTyAggregateTy {
+    Struct,
+    Union,
+}
+
+pub struct IrVarTyAggregate<'a> {
+    pub ty: IrVarTyAggregateTy,
+    pub fields: &'a [IrVarTy],
+}
+
+pub struct IrVarTyInfo {
+    pub size: usize,
+    pub alignment: usize,
+}
 
 impl IrVarTy {
     pub fn ty_none() -> IrVarTy {
@@ -899,6 +1025,9 @@ impl IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_POINTER })
     }
 
+    pub fn ty_i1() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I1 })
+    }
     pub fn ty_i8() -> IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_I8 })
     }
@@ -925,6 +1054,25 @@ impl IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_F64 })
     }
     // const F128: Self = Self(unsafe { IR_VAR_TY_F128 });
+
+    pub fn aggregate(&self) -> Option<IrVarTyAggregate> {
+        let ty;
+        match self.0.ty {
+            IR_VAR_TY_TY_STRUCT => ty = IrVarTyAggregateTy::Struct,
+            IR_VAR_TY_TY_UNION => ty = IrVarTyAggregateTy::Union,
+            _ => return None,
+        };
+
+        // SAFETY: repr(transparent)
+        let fields = unsafe {
+            slice::from_raw_parts(
+                self.0._1.aggregate.fields.cast::<IrVarTy>(),
+                self.0._1.aggregate.num_fields,
+            )
+        };
+
+        Some(IrVarTyAggregate { ty, fields })
+    }
 
     pub fn is_aggregate(&self) -> bool {
         match self.0.ty {

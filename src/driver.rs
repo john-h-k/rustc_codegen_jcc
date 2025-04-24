@@ -7,7 +7,7 @@ use std::{
     ptr,
 };
 
-use rustc_abi::{AddressSpace, HasDataLayout, Primitive, Scalar, WrappingRange};
+use rustc_abi::{AddressSpace, FieldsShape, HasDataLayout, Primitive, Scalar, WrappingRange};
 use rustc_ast::token::NtPatKind::PatWithOr;
 use rustc_codegen_ssa::{
     CrateInfo,
@@ -25,26 +25,28 @@ use rustc_const_eval::interpret::{
 use rustc_data_structures::{fx::FxHashMap, profiling::SelfProfilerRef};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
+    bug,
     mir::{
         BasicBlock, BasicBlockData, Statement, StatementKind, TerminatorKind,
-        mono::{CodegenUnit, MonoItem},
+        mono::{CodegenUnit, Linkage, MonoItem, Visibility},
     },
     ty::{
         self, EarlyBinder, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
-        layout::{FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout},
+        layout::{FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout},
     },
 };
 use rustc_session::Session;
 use rustc_span::{Symbol, def_id::DefId, sym::abi};
-use rustc_target::callconv::CastTarget;
+use rustc_target::callconv::{ArgAbi, CastTarget, FnAbi, PassMode};
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
     jcc::{
         alloc::{ArenaAlloc, ArenaAllocRef},
         ir::{
             self, AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp,
-            IrUnit, IrVarTy, IrVarTyFuncFlags,
+            IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
         },
     },
     jcc_sys::{self, IR_FUNC_FLAG_NONE},
@@ -68,29 +70,41 @@ trait TypedDebug: Debug {
 
 impl<T: ?Sized + Debug> TypedDebug for T {}
 
-fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, unit: &IrUnit, ty: &Ty<'tcx>) -> IrVarTy {
+fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, unit: &IrUnit, ty: &TyAndLayout<'tcx>) -> IrVarTy {
+    let TyAndLayout { ty, layout } = ty;
+
     match ty.kind() {
-        TyKind::Never => unit.none(),
-        TyKind::Tuple(tys) if tys.len() == 0 => unit.none(),
-        TyKind::Bool => unit.integer(IrIntTy::I1),
-        TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => unit.integer(IrIntTy::I8),
-        TyKind::Char => unit.integer(IrIntTy::I32),
-        TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => unit.integer(IrIntTy::I16),
-        TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) => unit.integer(IrIntTy::I32),
-        TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => unit.integer(IrIntTy::I64),
+        TyKind::Never => unit.var_ty_none(),
+        TyKind::Tuple(tys) if tys.len() == 0 => unit.var_ty_none(),
+        TyKind::Bool => unit.var_ty_integer(IrIntTy::I1),
+        TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => unit.var_ty_integer(IrIntTy::I8),
+        TyKind::Char => unit.var_ty_integer(IrIntTy::I32),
+        TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => unit.var_ty_integer(IrIntTy::I16),
+        TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) => unit.var_ty_integer(IrIntTy::I32),
+        TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => unit.var_ty_integer(IrIntTy::I64),
         // FIXME: should be ptr-sized int
-        TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => unit.pointer(),
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => unit.integer(IrIntTy::I128),
-        TyKind::Float(FloatTy::F16) => unit.float(IrFloatTy::F16),
-        TyKind::Float(FloatTy::F32) => unit.float(IrFloatTy::F32),
-        TyKind::Float(FloatTy::F64) => unit.float(IrFloatTy::F64),
+        TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => unit.var_ty_pointer(),
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => unit.var_ty_integer(IrIntTy::I128),
+        TyKind::Float(FloatTy::F16) => unit.var_ty_float(IrFloatTy::F16),
+        TyKind::Float(FloatTy::F32) => unit.var_ty_float(IrFloatTy::F32),
+        TyKind::Float(FloatTy::F64) => unit.var_ty_float(IrFloatTy::F64),
         TyKind::Float(FloatTy::F128) => todo!("f128"),
-        TyKind::FnPtr(..) => unit.pointer(),
+        TyKind::FnPtr(..) => unit.var_ty_pointer(),
         TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
             if tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()) {
-                panic!("ptr with metadata");
+                // is this correct? metadata type = { ptr, ptr }?
+
+                let FieldsShape::Arbitrary {
+                    offsets,
+                    memory_index,
+                } = layout.fields()
+                else {
+                    bug!()
+                };
+
+                dbg!(unit.var_ty_fat_pointer())
             } else {
-                unit.pointer()
+                unit.var_ty_pointer()
             }
         }
         _ => panic!("bad ty {ty:?}, {:?}", ty.kind().typed_debug()),
@@ -123,7 +137,20 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
-        self.fn_map.borrow()[&instance]
+        // TODO: vis/link won't be updated properly in predefine_fn
+        let sym = self.tcx.symbol_name(instance).name;
+        let (_, params, ret) = self.abi_of(instance);
+        let glb = self.declare_fn(
+            instance,
+            Linkage::External,
+            Visibility::Default,
+            sym,
+            &params[..],
+            &ret,
+        );
+
+        self.fn_map.borrow_mut().insert(instance, glb);
+        glb
     }
 
     fn alloc_bytes_var(&self, alloc: &ConstAllocation<'_>) -> IrGlb {
@@ -131,7 +158,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let alloc = alloc.inner();
 
         let unit = self.unit;
-        let ty = unit.bytes(alloc.len());
+        let ty = unit.var_ty_bytes(alloc.len());
 
         let glb = unit.add_global_def_var(ty, None);
         let var = glb.var();
@@ -273,7 +300,7 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
 
 impl<'tcx> HasDataLayout for CodegenCx<'tcx> {
     fn data_layout(&self) -> &rustc_abi::TargetDataLayout {
-        todo!()
+        self.tcx.data_layout()
     }
 }
 
@@ -303,17 +330,21 @@ impl<'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'tcx> {
 }
 
 impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
-    type FnAbiOfResult = &'tcx rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>;
+    type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
 
     fn handle_fn_abi_err(
         &self,
         err: ty::layout::FnAbiError<'tcx>,
         span: rustc_span::Span,
         fn_abi_request: ty::layout::FnAbiRequest<'tcx>,
-    ) -> <Self::FnAbiOfResult as ty::layout::MaybeResult<
-        &'tcx rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
-    >>::Error {
+    ) -> <Self::FnAbiOfResult as ty::layout::MaybeResult<&'tcx FnAbi<'tcx, Ty<'tcx>>>>::Error {
         todo!()
+    }
+}
+
+impl CodegenCx<'_> {
+    pub fn type_i1(&self) -> IrVarTy {
+        IrVarTy::ty_i1()
     }
 }
 
@@ -360,11 +391,11 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn type_array(&self, ty: Self::Type, len: u64) -> Self::Type {
-        self.unit.array(&ty, len as _)
+        self.unit.var_ty_array(&ty, len as _)
     }
 
     fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::Type {
-        self.unit.func(args, &ret, IrVarTyFuncFlags::None)
+        self.unit.var_ty_func(args, &ret, IrVarTyFuncFlags::None)
     }
 
     fn type_kind(&self, ty: Self::Type) -> rustc_codegen_ssa::common::TypeKind {
@@ -372,11 +403,11 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn type_ptr(&self) -> Self::Type {
-        self.unit.pointer()
+        self.unit.var_ty_pointer()
     }
 
     fn type_ptr_ext(&self, _address_space: rustc_abi::AddressSpace) -> Self::Type {
-        self.unit.pointer()
+        self.unit.var_ty_pointer()
     }
 
     fn element_type(&self, ty: Self::Type) -> Self::Type {
@@ -396,7 +427,7 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn val_ty(&self, v: Self::Value) -> Self::Type {
-        todo!()
+        v.var_ty()
     }
 }
 
@@ -417,7 +448,11 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
-        todo!()
+        let glb = self.get_glb(instance);
+
+        let op = self.alloc_next_op();
+        op.mk_addr_glb(glb);
+        op
     }
 
     fn eh_personality(&self) -> Self::Value {
@@ -447,24 +482,20 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        todo!()
+        ty_to_jcc_ty(self.tcx, &self.unit, &layout)
     }
 
     fn cast_backend_type(&self, ty: &CastTarget) -> Self::Type {
         todo!()
     }
 
-    fn fn_decl_backend_type(
-        &self,
-        fn_abi: &rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
-    ) -> Self::Type {
-        todo!()
+    fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type {
+        let (params, ret) = self.abi_fn_ty(fn_abi);
+        self.unit
+            .var_ty_func(&params[..], &ret, IrVarTyFuncFlags::None)
     }
 
-    fn fn_ptr_backend_type(
-        &self,
-        fn_abi: &rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
-    ) -> Self::Type {
+    fn fn_ptr_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type {
         todo!()
     }
 
@@ -473,7 +504,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        ty_to_jcc_ty(self.tcx, &self.unit, &layout.ty)
+        ty_to_jcc_ty(self.tcx, &self.unit, &layout)
     }
 
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
@@ -482,13 +513,16 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
             | TyKind::Char
             | TyKind::Int(..)
             | TyKind::Uint(..)
-            | TyKind::Float(..) => true,
+            | TyKind::Float(..)
+            | TyKind::RawPtr(..)
+            | TyKind::Ref(..) => true,
             _ => false,
         }
     }
 
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool {
-        false
+        let kind = layout.ty.kind();
+        matches!(kind, TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) if self.tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()))
     }
 
     fn scalar_pair_element_backend_type(
@@ -603,7 +637,11 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_usize(&self, i: u64) -> Self::Value {
-        todo!()
+        // TODO: ptr size
+        let ty = self.type_isize();
+        let op = self.alloc_next_op();
+        op.mk_cnst_int(ty, i);
+        op
     }
 
     fn const_uint(&self, t: Self::Type, i: u64) -> Self::Value {
@@ -672,7 +710,10 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                     GlobalAlloc::Static(def_id) => todo!(),
                     GlobalAlloc::Memory(const_allocation) => {
                         let glb = self.alloc_bytes_var(&const_allocation);
-                        todo!()
+
+                        let op = self.alloc_next_op();
+                        op.mk_addr_glb(glb);
+                        op
                     }
                 }
             }
@@ -706,7 +747,7 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn create_function_debug_context(
         &self,
         instance: Instance<'tcx>,
-        fn_abi: &rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Function,
         mir: &rustc_middle::mir::Body<'tcx>,
     ) -> Option<
@@ -723,7 +764,7 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn dbg_scope_fn(
         &self,
         instance: Instance<'tcx>,
-        fn_abi: &rustc_target::callconv::FnAbi<'tcx, Ty<'tcx>>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         maybe_definition_llfn: Option<Self::Function>,
     ) -> Self::DIScope {
         todo!()
@@ -785,12 +826,98 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
     }
 }
 
+impl<'tcx> CodegenCx<'tcx> {
+    // TODO: use smallvec
+    fn abi_map_ty(&self, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> SmallVec<[IrVarTy; 2]> {
+        let ty = self.backend_type(arg.layout);
+
+        match &arg.mode {
+            PassMode::Ignore => SmallVec::default(),
+            PassMode::Direct(arg_attributes) => smallvec![ty],
+            PassMode::Pair(arg_attributes, arg_attributes1) => {
+                let Some(IrVarTyAggregate {
+                    ty: IrVarTyAggregateTy::Struct,
+                    fields: &[_0, _1],
+                    ..
+                }) = ty.aggregate()
+                else {
+                    bug!("expected Pair to be struct aggregate with two fields");
+                };
+
+                smallvec![_0, _1]
+            }
+            PassMode::Cast { pad_i32, cast } => todo!(),
+            PassMode::Indirect {
+                attrs,
+                meta_attrs,
+                on_stack,
+            } => todo!(),
+        }
+    }
+
+    fn abi_fn_ty<'a: 'tcx>(&self, fn_abi: &FnAbi<'a, Ty<'tcx>>) -> (Vec<IrVarTy>, IrVarTy) {
+        let params = &fn_abi.args;
+        let ret = &fn_abi.ret;
+
+        let params = params
+            .iter()
+            .flat_map(|arg| self.abi_map_ty(arg))
+            .collect::<Vec<_>>();
+
+        let ret = self.backend_type(ret.layout);
+
+        (params, ret)
+    }
+
+    fn abi_of(&self, instance: Instance<'tcx>) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy>, IrVarTy) {
+        let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
+        let (params, ret) = self.abi_fn_ty(fn_abi);
+        (fn_abi, params, ret)
+    }
+
+    fn declare_fn(
+        &self,
+        instance: Instance<'tcx>,
+        linkage: Linkage,
+        visibility: Visibility,
+        symbol_name: &str,
+        params: &[IrVarTy],
+        ret: &IrVarTy,
+    ) -> IrGlb {
+        if let Some(glb) = self.fn_map.borrow().get(&instance).copied() {
+            return glb;
+        }
+
+        // FIXME: variadic flag for variadic fn
+        let fun_ty = self
+            .unit
+            .var_ty_func(&params[..], &ret, IrVarTyFuncFlags::None);
+
+        // TODO: visibility
+        if self.tcx.is_foreign_item(instance.def_id()) {
+            self.unit.add_global_undef_func(fun_ty, symbol_name)
+        } else {
+            self.unit.add_global_def_func(fun_ty, symbol_name)
+        }
+        // match linkage {
+        //     Linkage::External
+        //     | Linkage::AvailableExternally
+        //     | Linkage::LinkOnceAny
+        //     | Linkage::LinkOnceODR
+        //     | Linkage::WeakAny
+        //     | Linkage::WeakODR
+        //     | Linkage::ExternalWeak => unit.add_global_undef_func(fun_ty, symbol_name),
+        //     Linkage::Internal | Linkage::Common => unit.add_global_def_func(fun_ty, symbol_name),
+        // }
+    }
+}
+
 impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn predefine_static(
         &self,
         def_id: DefId,
-        linkage: rustc_middle::mir::mono::Linkage,
-        visibility: rustc_middle::mir::mono::Visibility,
+        linkage: Linkage,
+        visibility: Visibility,
         symbol_name: &str,
     ) {
         todo!()
@@ -799,55 +926,46 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn predefine_fn(
         &self,
         instance: Instance<'tcx>,
-        linkage: rustc_middle::mir::mono::Linkage,
-        visibility: rustc_middle::mir::mono::Visibility,
+        linkage: Linkage,
+        visibility: Visibility,
         symbol_name: &str,
     ) {
-        let kind = instance
-            .ty(self.tcx, TypingEnv::fully_monomorphized())
-            .kind();
-
-        let def_id = instance.def.def_id();
-        let param_env = self.tcx.param_env(def_id);
-
-        let sig = kind.fn_sig(self.tcx).skip_binder();
-
-        let params = sig.inputs();
-        let ret = sig.output();
+        let (_, params, ret) = self.abi_of(instance);
+        let glb = self.declare_fn(
+            instance,
+            linkage,
+            visibility,
+            symbol_name,
+            &params[..],
+            &ret,
+        );
+        let fun = glb.func();
 
         let unit = self.unit;
 
-        let params = params
-            .iter()
-            .map(|ty| ty_to_jcc_ty(self.tcx, &unit, ty))
-            .collect::<Vec<_>>();
+        if glb.is_def() {
+            // FIXME: recompute params in `declare_fn` and here
+            let bb = fun.alloc_basicblock();
 
-        let ret = ty_to_jcc_ty(self.tcx, &unit, &ret);
+            if params.len() > 0 {
+                let param_stmt = fun.mk_param_stmt();
 
-        // FIXME: variadic flag for variadic fn
-        let fun_ty = unit.func(&params[..], &ret, IrVarTyFuncFlags::None);
+                for param in params {
+                    if param.is_aggregate() {
+                        let lcl = fun.add_local(param);
 
-        let glb = unit.add_global_def_func(fun_ty, symbol_name);
-        let fun = glb.func();
-
-        let bb = fun.alloc_basicblock();
-        if params.len() > 0 {
-            let param_stmt = fun.mk_param_stmt();
-
-            for param in params {
-                if param.is_aggregate() {
-                    let lcl = fun.add_local(param);
-
-                    let op = param_stmt.alloc_op();
-                    op.mk_lcl_param(param);
-                } else {
-                    let op = param_stmt.alloc_op();
-                    op.mk_mov_param(param);
+                        let op = param_stmt.alloc_op();
+                        op.mk_lcl_param(param);
+                    } else {
+                        let op = param_stmt.alloc_op();
+                        op.mk_mov_param(param);
+                    }
                 }
             }
+
+            *self.cur_bb.borrow_mut() = Some(bb);
         }
 
-        *self.cur_bb.borrow_mut() = Some(bb);
         self.fn_map.borrow_mut().insert(instance, glb);
     }
 }

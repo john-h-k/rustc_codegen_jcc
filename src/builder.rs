@@ -1,12 +1,19 @@
-use std::ops::{Deref, Range};
+use std::{
+    num::NonZeroUsize,
+    ops::{Deref, Range},
+};
 
-use rustc_abi::{HasDataLayout, TargetDataLayout};
+use rustc_abi::{BackendRepr, HasDataLayout, TargetDataLayout};
 use rustc_codegen_ssa::{
-    mir::place::PlaceRef,
+    mir::{
+        operand::{OperandRef, OperandValue},
+        place::PlaceRef,
+    },
     traits::{
-        AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes, BuilderMethods,
-        CoverageInfoBuilderMethods, DebugInfoBuilderMethods, IntrinsicCallBuilderMethods,
-        StaticBuilderMethods,
+        AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes,
+        BaseTypeCodegenMethods, BuilderMethods, ConstCodegenMethods, CoverageInfoBuilderMethods,
+        DebugInfoBuilderMethods, IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods,
+        MiscCodegenMethods, StaticBuilderMethods,
     },
 };
 use rustc_middle::{
@@ -23,7 +30,7 @@ use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 
 use crate::{
     CodegenCx, JccModule,
-    jcc::ir::{HasNext, IrBasicBlock, IrBasicBlockTy, IrFunc, IrIntTy, IrOp, IrVarTy},
+    jcc::ir::{AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrFunc, IrIntTy, IrOp, IrVarTy},
 };
 
 pub struct Builder<'a, 'tcx> {
@@ -79,7 +86,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         &mut self,
         instance: Instance<'tcx>,
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-        args: &[rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value>],
+        args: &[OperandRef<'tcx, Self::Value>],
         llresult: Self::Value,
         span: rustc_span::Span,
     ) -> Result<(), Instance<'tcx>> {
@@ -122,7 +129,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 
 impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
     fn get_param(&mut self, index: usize) -> Self::Value {
-        todo!()
+        self.cur_bb.borrow().unwrap().func().get_param_op(index)
     }
 }
 
@@ -239,7 +246,7 @@ impl<'a, 'tcx> LayoutOfHelpers<'tcx> for Builder<'a, 'tcx> {
 
 impl<'a, 'tcx> HasDataLayout for Builder<'a, 'tcx> {
     fn data_layout(&self) -> &TargetDataLayout {
-        todo!()
+        self.cx.data_layout()
     }
 }
 
@@ -524,7 +531,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn from_immediate(&mut self, val: Self::Value) -> Self::Value {
-        todo!()
+        if self.cx().val_ty(val) == self.cx().type_i1() {
+            self.zext(val, self.cx().type_i8())
+        } else {
+            val
+        }
     }
 
     fn to_immediate_scalar(&mut self, val: Self::Value, scalar: rustc_abi::Scalar) -> Self::Value {
@@ -536,7 +547,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // only "alloc local"
 
         let sz = size.bytes_usize();
-        let ty = self.unit.bytes(sz);
+        let ty = self.unit.var_ty_bytes(sz);
 
         let bb = self.cur_bb.borrow().unwrap();
         let lcl = bb.func().add_local(ty);
@@ -573,13 +584,68 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn load_operand(
         &mut self,
         place: PlaceRef<'tcx, Self::Value>,
-    ) -> rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value> {
-        todo!()
+    ) -> OperandRef<'tcx, Self::Value> {
+        if place.layout.is_zst() {
+            todo!("load zst");
+        }
+
+        // let op = self.alloc_next_op();
+        // op.mk_store_addr(ptr, val);
+        // op
+
+        let val = if place.val.llextra.is_some() {
+            // FIXME: Merge with the `else` below?
+            OperandValue::Ref(place.val)
+        } else if self.is_backend_immediate(place.layout) {
+            let load = self.load(
+                self.backend_type(place.layout),
+                place.val.llval,
+                place.val.align,
+            );
+
+            OperandValue::Immediate(
+                if let BackendRepr::Scalar(ref scalar) = place.layout.backend_repr {
+                    self.to_immediate_scalar(load, *scalar)
+                } else {
+                    load
+                },
+            )
+        } else if let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr {
+            let b_offset = a.size(self).align_to(b.align(self).abi);
+            let mut load = |i, scalar: &rustc_abi::Scalar, align| {
+                let llptr = if i == 0 {
+                    place.val.llval
+                } else {
+                    self.inbounds_ptradd(place.val.llval, self.const_usize(b_offset.bytes()))
+                };
+
+                // let llty = place.layout.scalar_pair_element_gcc_type(self, i);
+                // let load = self.load(llty, llptr, align);
+                // scalar_load_metadata(self, load, scalar);
+                // if scalar.is_bool() {
+                //     self.trunc(load, self.type_i1())
+                // } else {
+                //     load
+                // }
+            };
+            OperandValue::Pair(
+                load(0, a, place.val.align),
+                load(1, b, place.val.align.restrict_for_offset(b_offset)),
+            );
+            todo!("pairs")
+        } else {
+            OperandValue::Ref(place.val)
+        };
+
+        OperandRef {
+            val,
+            layout: place.layout,
+        }
     }
 
     fn write_operand_repeatedly(
         &mut self,
-        elem: rustc_codegen_ssa::mir::operand::OperandRef<'tcx, Self::Value>,
+        elem: OperandRef<'tcx, Self::Value>,
         count: u64,
         dest: PlaceRef<'tcx, Self::Value>,
     ) {
@@ -610,7 +676,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         align: rustc_abi::Align,
         flags: rustc_codegen_ssa::MemFlags,
     ) -> Self::Value {
-        todo!()
+        // FIXME: `align`
+        if !flags.is_empty() {
+            todo!("mem flags");
+        }
+
+        let op = self.alloc_next_op();
+        op.mk_store_addr(ptr, val);
+        op
     }
 
     fn atomic_store(
@@ -633,7 +706,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ptr: Self::Value,
         indices: &[Self::Value],
     ) -> Self::Value {
-        todo!()
+        debug_assert!(
+            indices.len() == 1,
+            "multi-index gep (how do we calculate the other types scales?)",
+        );
+
+        let index = indices[0];
+        let base = ptr;
+        let scale = self.unit.var_ty_info(ty).size;
+        let scale = NonZeroUsize::new(scale).unwrap();
+
+        let op = self.alloc_next_op();
+        op.mk_addr_offset(AddrOffset::index(base, index, scale));
+        op
     }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -867,7 +952,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         funclet: Option<&Self::Funclet>,
         instance: Option<Instance<'tcx>>,
     ) -> Self::Value {
-        todo!()
+        // TODO: fn ptr calls (not addr-glb)
+        // let Some(fn_glb) = llfn.get_addr_glb() else {
+        //     todo!("non direct calls");
+        // };
+
+        let ret = fn_abi.map(|f| self.backend_type(f.ret.layout));
+        let ret = ret.expect("no abi?");
+
+        let op = self.alloc_next_op();
+        op.mk_call(llty, llfn, args, ret);
+        op
     }
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
