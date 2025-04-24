@@ -28,10 +28,12 @@ extern crate rustc_target;
 extern crate rustc_ty_utils;
 extern crate rustc_type_ir;
 
+mod builder;
 mod driver;
 mod jcc;
 mod jcc_sys;
 
+use builder::Builder;
 use driver::{CodegenCx, JccModule};
 use rustc_ast::expand::{allocator::AllocatorKind, autodiff_attrs::AutoDiffItem};
 use rustc_codegen_ssa::{
@@ -44,9 +46,10 @@ use rustc_codegen_ssa::{
             TargetMachineFactoryFn,
         },
     },
+    mono_item::MonoItemExt,
     traits::{
-        CodegenBackend, ExtraBackendMethods, ModuleBufferMethods, ThinBufferMethods,
-        WriteBackendMethods,
+        BuilderMethods, CodegenBackend, ExtraBackendMethods, ModuleBufferMethods,
+        ThinBufferMethods, WriteBackendMethods,
     },
 };
 
@@ -180,9 +183,16 @@ impl ExtraBackendMethods for JccCodegenBackend {
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
     ) -> (ModuleCodegen<Self::Module>, u64) {
-        let mut cx = CodegenCx::new(tcx);
+        let builder = Builder::new(tcx);
 
-        let module = cx.emit_cgu(cgu_name);
+        let cgu = tcx.codegen_unit(cgu_name);
+
+        for (item, data) in cgu.items() {
+            item.predefine::<Builder<'_>>(&builder, data.linkage, data.visibility);
+        }
+
+        let module = builder.module();
+
         let cost = 100;
 
         let module = ModuleCodegen::new_regular(cgu_name.to_string(), module);
@@ -296,6 +306,7 @@ impl WriteBackendMethods for JccCodegenBackend {
         let _timer = cgcx
             .prof
             .generic_activity_with_arg("JCC_module_codegen", &*module.name);
+
         {
             let jcc_mod = &module.module_llvm;
             let module_name = module.name.clone();

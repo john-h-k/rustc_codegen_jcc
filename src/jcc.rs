@@ -1,11 +1,23 @@
 use std::{
     alloc::{AllocError, Allocator, Layout},
-    mem::MaybeUninit,
+    mem::{self, MaybeUninit},
     ptr::NonNull,
     slice,
 };
 
 use crate::jcc_sys::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrVarTy;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrFunc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrOp;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrBasicBlock;
 
 pub struct ArenaAlloc(*mut arena_allocator);
 
@@ -25,8 +37,12 @@ impl ArenaAlloc {
         self.0
     }
 
-    #[allow(dead_code)]
-    pub fn alloc(&self, size: usize) -> NonNull<[u8]> {
+    pub fn alloc<T>(&self) -> *mut T {
+        let ptr = self.alloc_raw(mem::size_of::<T>());
+        NonNull::as_ptr(ptr) as _
+    }
+
+    pub fn alloc_raw(&self, size: usize) -> NonNull<[u8]> {
         unsafe {
             self.allocate(Layout::from_size_align_unchecked(size, DEFAULT_ALIGN))
                 .unwrap()
