@@ -39,14 +39,13 @@ mod jcc_sys;
 use builder::Builder;
 use driver::{CodegenCx, JccModule};
 use jcc::{
-    alloc::{ArenaAlloc, ArenaAllocRef},
+    alloc::ArenaAlloc,
     compiler::Compiler,
 };
 use rustc_ast::expand::{allocator::AllocatorKind, autodiff_attrs::AutoDiffItem};
 use rustc_codegen_ssa::{
-    CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
+    CodegenResults, CompiledModule, ModuleCodegen,
     back::{
-        archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
         lto::{LtoModuleCodegen, SerializedModule, ThinModule},
         write::{
             CodegenContext, EmitObj, FatLtoInput, ModuleConfig, OngoingCodegen,
@@ -55,7 +54,7 @@ use rustc_codegen_ssa::{
     },
     mono_item::MonoItemExt,
     traits::{
-        BuilderMethods, CodegenBackend, ExtraBackendMethods, ModuleBufferMethods,
+        CodegenBackend, ExtraBackendMethods, ModuleBufferMethods,
         ThinBufferMethods, WriteBackendMethods,
     },
 };
@@ -75,7 +74,7 @@ use rustc_session::{
 use rustc_span::{Symbol, sym};
 
 use std::{
-    any::Any, ffi::CString, fs::File, io::Write, os::unix::ffi::OsStringExt, ptr, sync::Arc,
+    any::Any, os::unix::ffi::OsStringExt, sync::Arc,
 };
 
 #[derive(Clone)]
