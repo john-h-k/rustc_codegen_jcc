@@ -31,6 +31,7 @@ fn chk_null_safe(bytes: &[u8]) {
 }
 
 // NON OWNING!
+#[derive(Clone, Copy)]
 pub struct ArenaAllocRef(*mut arena_allocator);
 
 // OWNING!

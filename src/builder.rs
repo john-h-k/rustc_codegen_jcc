@@ -535,9 +535,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // HACK: we don't have "alloc size"
         // only "alloc local"
 
-        let byte = self.unit.integer(IrIntTy::I8);
         let sz = size.bytes_usize();
-        let ty = self.unit.array(&byte, sz);
+        let ty = self.unit.bytes(sz);
 
         let bb = self.cur_bb.borrow().unwrap();
         let lcl = bb.func().add_local(ty);

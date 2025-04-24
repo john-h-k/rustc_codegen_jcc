@@ -1,22 +1,27 @@
 use std::{
     cell::RefCell,
     ffi::{self, CString},
+    mem,
     num::NonZeroUsize,
+    ops::Range,
     ptr,
 };
 
-use rustc_abi::HasDataLayout;
+use rustc_abi::{AddressSpace, HasDataLayout, Primitive, Scalar, WrappingRange};
 use rustc_ast::token::NtPatKind::PatWithOr;
 use rustc_codegen_ssa::{
     CrateInfo,
     mono_item::MonoItemExt,
     traits::{
-        AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods, ConstCodegenMethods,
-        DebugInfoCodegenMethods, ExtraBackendMethods, LayoutTypeCodegenMethods, MiscCodegenMethods,
-        PreDefineCodegenMethods, StaticCodegenMethods, TypeMembershipCodegenMethods,
+        AbiBuilderMethods, AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods,
+        ConstCodegenMethods, DebugInfoCodegenMethods, ExtraBackendMethods,
+        LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
+        StaticCodegenMethods, TypeMembershipCodegenMethods,
     },
 };
-use rustc_const_eval::interpret;
+use rustc_const_eval::interpret::{
+    self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, Pointer, read_target_uint,
+};
 use rustc_data_structures::{fx::FxHashMap, profiling::SelfProfilerRef};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
@@ -30,16 +35,16 @@ use rustc_middle::{
     },
 };
 use rustc_session::Session;
-use rustc_span::{Symbol, def_id::DefId};
+use rustc_span::{Symbol, def_id::DefId, sym::abi};
 use rustc_target::callconv::CastTarget;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
 use crate::{
     jcc::{
-        alloc::ArenaAllocRef,
+        alloc::{ArenaAlloc, ArenaAllocRef},
         ir::{
-            self, AddrOffset, IrBasicBlock, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp, IrUnit,
-            IrVarTy, IrVarTyFuncFlags,
+            self, AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp,
+            IrUnit, IrVarTy, IrVarTyFuncFlags,
         },
     },
     jcc_sys::{self, IR_FUNC_FLAG_NONE},
@@ -102,6 +107,7 @@ unsafe impl Sync for JccModule {}
 pub struct CodegenCx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub unit: IrUnit,
+    pub arena: ArenaAlloc,
 
     pub fn_map: RefCell<FxHashMap<Instance<'tcx>, IrGlb>>,
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrOp>>,
@@ -114,6 +120,126 @@ impl<'tcx> CodegenCx<'tcx> {
         let bb = self.cur_bb.borrow().unwrap();
         let stmt = bb.alloc_stmt();
         stmt.alloc_op()
+    }
+
+    fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
+        self.fn_map.borrow()[&instance]
+    }
+
+    fn alloc_bytes_var(&self, alloc: &ConstAllocation<'_>) -> IrGlb {
+        let arena = self.arena.as_ref();
+        let alloc = alloc.inner();
+
+        let unit = self.unit;
+        let ty = unit.bytes(alloc.len());
+
+        let glb = unit.add_global_def_var(ty, None);
+        let var = glb.var();
+
+        let mut llvals = Vec::with_capacity_in(alloc.provenance().ptrs().len() + 1, arena);
+
+        let dl = self.data_layout();
+        let pointer_size = dl.pointer_size.bytes() as usize;
+
+        // Note: this function may call `inspect_with_uninit_and_ptr_outside_interpreter`, so `range`
+        // must be within the bounds of `alloc` and not contain or overlap a pointer provenance.
+        fn append_chunks_of_init_and_uninit_bytes<'a, 'b>(
+            cx: &'a CodegenCx<'b>,
+            llvals: &mut Vec<IrBytes<'a>, &ArenaAllocRef>,
+            alloc: &'a Allocation,
+            range: Range<usize>,
+        ) {
+            let offset = range.start;
+            let chunks = alloc.init_mask().range_as_init_chunks(range.clone().into());
+
+            let chunk_to_llval = move |chunk| match chunk {
+                InitChunk::Init(range) => {
+                    let range = (range.start.bytes() as usize)..(range.end.bytes() as usize);
+                    let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
+
+                    Some(IrBytes::new(offset, bytes))
+                }
+                InitChunk::Uninit(range) => {
+                    // do nothing, all ranges outside of value lists are uninit
+                    // (or they are zeroed currently i think? but they are _meant_ be uninit)
+                    None
+                }
+            };
+
+            // Generating partially-uninit consts is limited to small numbers of chunks,
+            // to avoid the cost of generating large complex const expressions.
+            // For example, `[(u32, u8); 1024 * 1024]` contains uninit padding in each element, and
+            // would result in `{ [5 x i8] zeroinitializer, [3 x i8] undef, ...repeat 1M times... }`.
+            let max = cx.sess().opts.unstable_opts.uninit_const_chunk_threshold;
+            let allow_uninit_chunks = chunks.clone().take(max.saturating_add(1)).count() <= max;
+
+            if allow_uninit_chunks {
+                llvals.extend(chunks.filter_map(chunk_to_llval));
+            } else {
+                // If this allocation contains any uninit bytes, codegen as if it was initialized
+                // (using some arbitrary value for uninit bytes).
+                let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
+                // llvals.push(cx.const_bytes(bytes));
+                llvals.push(IrBytes::new(offset, bytes));
+            }
+        }
+
+        let mut next_offset = 0;
+        for &(offset, prov) in alloc.provenance().ptrs().iter() {
+            let offset = offset.bytes();
+            assert_eq!(offset as usize as u64, offset);
+            let offset = offset as usize;
+            if offset > next_offset {
+                // This `inspect` is okay since we have checked that there is no provenance, it
+                // is within the bounds of the allocation, and it doesn't affect interpreter execution
+                // (we inspect the result after interpreter execution).
+                append_chunks_of_init_and_uninit_bytes(
+                    self,
+                    &mut llvals,
+                    alloc,
+                    next_offset..offset,
+                );
+            }
+            let ptr_offset = read_target_uint(
+                dl.endian,
+                // This `inspect` is okay since it is within the bounds of the allocation, it doesn't
+                // affect interpreter execution (we inspect the result after interpreter execution),
+                // and we properly interpret the provenance as a relocation pointer offset.
+                alloc.inspect_with_uninit_and_ptr_outside_interpreter(
+                    offset..(offset + pointer_size),
+                ),
+            )
+            .expect("const_alloc_to_llvm: could not read relocation pointer")
+                as u64;
+
+            let address_space = self.tcx.global_alloc(prov.alloc_id()).address_space(self);
+
+            todo!("ptr relocs");
+            // self.scalar_to_var_value(
+            //     interpret::Scalar::from_pointer(
+            //         Pointer::new(prov, rustc_abi::Size::from_bytes(ptr_offset)),
+            //         &self.tcx,
+            //     ),
+            //     Scalar::Initialized {
+            //         value: Primitive::Pointer(address_space),
+            //         valid_range: WrappingRange::full(dl.pointer_size),
+            //     },
+            //     self.type_ptr_ext(address_space),
+            // );
+
+            next_offset = offset + pointer_size;
+        }
+
+        if alloc.len() >= next_offset {
+            let range = next_offset..alloc.len();
+            // This `inspect` is okay since we have check that it is after all provenance, it is
+            // within the bounds of the allocation, and it doesn't affect interpreter execution (we
+            // inspect the result after interpreter execution).
+            append_chunks_of_init_and_uninit_bytes(self, &mut llvals, alloc, range);
+        }
+
+        var.mk_const_bytes(ty, &llvals[..]);
+        glb
     }
 }
 
@@ -193,51 +319,52 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     fn type_i8(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_i8()
     }
 
     fn type_i16(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_i16()
     }
 
     fn type_i32(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_i32()
     }
 
     fn type_i64(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_i64()
     }
 
     fn type_i128(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_i128()
     }
 
     fn type_isize(&self) -> Self::Type {
-        todo!()
+        // TODO: pointer size
+        IrVarTy::ty_i64()
     }
 
     fn type_f16(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_f16()
     }
 
     fn type_f32(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_f32()
     }
 
     fn type_f64(&self) -> Self::Type {
-        todo!()
+        IrVarTy::ty_f64()
     }
 
     fn type_f128(&self) -> Self::Type {
-        todo!()
+        todo!("f128")
     }
 
     fn type_array(&self, ty: Self::Type, len: u64) -> Self::Type {
-        todo!()
+        self.unit.array(&ty, len as _)
     }
 
     fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::Type {
-        todo!()
+        self.unit.func(args, &ret, IrVarTyFuncFlags::None)
     }
 
     fn type_kind(&self, ty: Self::Type) -> rustc_codegen_ssa::common::TypeKind {
@@ -245,11 +372,11 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn type_ptr(&self) -> Self::Type {
-        todo!()
+        self.unit.pointer()
     }
 
-    fn type_ptr_ext(&self, address_space: rustc_abi::AddressSpace) -> Self::Type {
-        todo!()
+    fn type_ptr_ext(&self, _address_space: rustc_abi::AddressSpace) -> Self::Type {
+        self.unit.pointer()
     }
 
     fn element_type(&self, ty: Self::Type) -> Self::Type {
@@ -286,7 +413,7 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn get_fn(&self, instance: Instance<'tcx>) -> Self::Function {
-        self.fn_map.borrow()[&instance].func()
+        self.get_glb(instance).func()
     }
 
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
@@ -387,6 +514,44 @@ impl<'tcx> TypeMembershipCodegenMethods<'tcx> for CodegenCx<'tcx> {
 
     fn set_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
 }
+
+// impl<'tcx> CodegenCx<'tcx> {
+// fn scalar_to_var_value(
+//     &self,
+//     cv: interpret::Scalar,
+//     layout: rustc_abi::Scalar,
+//     llty: IrVarTy,
+// ) -> () {
+//     match cv {
+//         interpret::Scalar::Int(scalar_int) => {
+//             // TODO: handle properly
+//             let value = scalar_int.to_bits_unchecked() as u64;
+
+//             let op = self.alloc_next_op();
+//             op.mk_cnst_int(llty, value);
+//             op
+//         }
+//         interpret::Scalar::Ptr(ptr, _size) => {
+//             let (prov, offset) = ptr.into_parts();
+//             let global_alloc = self.tcx.global_alloc(prov.alloc_id());
+//             match global_alloc {
+//                 GlobalAlloc::Function { instance } => {
+//                     let glb = self.get_glb(instance);
+
+//                     let op = self.alloc_next_op();
+//                     op.mk_addr_glb(glb);
+//                     op
+//                 }
+//                 GlobalAlloc::VTable(ty, raw_list) => todo!(),
+//                 GlobalAlloc::Static(def_id) => todo!(),
+//                 GlobalAlloc::Memory(const_allocation) => {
+//                     let glb = self.alloc_bytes_var(&const_allocation);
+//                 }
+//             }
+//         }
+//     }
+// }
+// }
 
 impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     fn const_null(&self, t: Self::Type) -> Self::Value {
@@ -492,7 +657,25 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                 op.mk_cnst_int(llty, value);
                 op
             }
-            interpret::Scalar::Ptr(pointer, _) => todo!(),
+            interpret::Scalar::Ptr(ptr, _size) => {
+                let (prov, offset) = ptr.into_parts();
+                let global_alloc = self.tcx.global_alloc(prov.alloc_id());
+                match global_alloc {
+                    GlobalAlloc::Function { instance } => {
+                        let glb = self.get_glb(instance);
+
+                        let op = self.alloc_next_op();
+                        op.mk_addr_glb(glb);
+                        op
+                    }
+                    GlobalAlloc::VTable(ty, raw_list) => todo!(),
+                    GlobalAlloc::Static(def_id) => todo!(),
+                    GlobalAlloc::Memory(const_allocation) => {
+                        let glb = self.alloc_bytes_var(&const_allocation);
+                        todo!()
+                    }
+                }
+            }
         }
     }
 
@@ -671,12 +854,14 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
 
 impl<'tcx> CodegenCx<'tcx> {
     pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Self {
-        let unit = IrUnit::new();
+        let arena = ArenaAlloc::new(b"codegen-cx");
+        let unit = IrUnit::new(*arena.as_ref());
         let fn_map = RefCell::new(FxHashMap::default());
         let vtables = RefCell::new(FxHashMap::default());
 
         Self {
             tcx,
+            arena,
             unit,
             fn_map,
             vtables,

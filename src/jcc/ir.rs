@@ -101,15 +101,9 @@ pub struct IrUnit {
 }
 
 impl IrUnit {
-    pub fn new() -> Self {
-        let mut arena = ptr::null_mut();
-        unsafe {
-            let name = CString::new("ir-unit").unwrap().into_raw();
-            arena_allocator_create(name, &mut arena);
-        }
-
+    pub fn new(arena: ArenaAllocRef) -> Self {
         let unit = ir_unit {
-            arena,
+            arena: arena.as_ptr(),
             // FIXME: target
             target: unsafe { &AARCH64_MACOS_TARGET },
             ..Default::default()
@@ -130,6 +124,10 @@ impl IrUnit {
 
     pub fn pointer(&self) -> IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_POINTER })
+    }
+
+    pub fn bytes(&self, size: usize) -> IrVarTy {
+        self.array(&self.integer(IrIntTy::I8), size)
     }
 
     pub fn array(&self, IrVarTy(el): &IrVarTy, len: usize) -> IrVarTy {
@@ -277,6 +275,7 @@ macro_rules! ir_object_newtype {
 
 ir_object_newtype!(IrGlb, ir_glb, IR_OBJECT_TY_GLB, glb);
 ir_object_newtype!(IrFunc, ir_func, IR_OBJECT_TY_FUNC, func);
+ir_object_newtype!(IrVar, ir_var, IR_OBJECT_TY_VAR, var);
 ir_object_newtype!(
     IrBasicBlock,
     ir_basicblock,
@@ -288,6 +287,17 @@ ir_object_newtype!(IrStmt, ir_stmt, IR_OBJECT_TY_STMT, stmt);
 ir_object_newtype!(IrOp, ir_op, IR_OBJECT_TY_OP, op);
 
 impl IrGlb {
+    pub fn var(&self) -> IrVar {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        unsafe {
+            assert_eq!(p.ty, IR_GLB_TY_DATA, "expected ir_glb to be of ty data");
+
+            assert!(!p._1.var.is_null(), "var was null (undef symbol)");
+
+            IrVar::from_raw(p._1.var)
+        }
+    }
+
     pub fn func(&self) -> IrFunc {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
@@ -337,6 +347,93 @@ impl<'a, Parent, T: Copy + FromIrRaw + HasNext> Iterator for IterFunc<'a, Parent
 
         self.cur = cur.next();
         Some(cur)
+    }
+}
+
+pub struct IrBytes<'a> {
+    offset: usize,
+    bytes: &'a [u8],
+}
+
+impl<'a> IrBytes<'a> {
+    pub fn new(offset: usize, bytes: &'a [u8]) -> Self {
+        Self { offset, bytes }
+    }
+}
+
+pub fn mk_bytes_list(unit: IrUnit, bytes: &[u8]) -> ir_var_value_list {
+    let arena = unit.mk_arena();
+
+    let mut offsets = Vec::new_in(arena);
+    let mut values = Vec::new_in(arena);
+    let num_values = bytes.len();
+
+    for (i, &byte) in bytes.iter().enumerate() {
+        offsets.push(i);
+
+        let value = ir_var_value {
+            ty: IR_VAR_VALUE_TY_INT,
+            var_ty: unsafe { IR_VAR_TY_I8 },
+            _1: ir_var_value__bindgen_ty_1 {
+                int_value: byte as _,
+            },
+        };
+
+        values.push(value);
+    }
+
+    let values = values.leak().as_mut_ptr();
+    let offsets = offsets.leak().as_mut_ptr();
+
+    ir_var_value_list {
+        values,
+        offsets,
+        num_values,
+    }
+}
+
+impl IrVar {
+    pub fn unit(&self) -> IrUnit {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        IrUnit::from_non_null(unsafe { NonNull::new_unchecked(p.unit) })
+    }
+
+    pub fn mk_const_bytes(&self, IrVarTy(var_ty): IrVarTy, bytes: &[IrBytes]) {
+        let unit = self.unit();
+        let arena = unit.mk_arena();
+
+        let mut offsets = Vec::new_in(arena);
+        let mut values = Vec::new_in(arena);
+        let num_values = bytes.len();
+
+        for chunk in bytes {
+            let ty = unit.bytes(chunk.bytes.len());
+
+            offsets.push(chunk.offset);
+            values.push(ir_var_value {
+                ty: IR_VAR_VALUE_TY_VALUE_LIST,
+                var_ty,
+                _1: ir_var_value__bindgen_ty_1 {
+                    value_list: mk_bytes_list(unit, chunk.bytes),
+                },
+            });
+        }
+
+        let values = values.leak().as_mut_ptr();
+        let offsets = offsets.leak().as_mut_ptr();
+
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        p.value = ir_var_value {
+            ty: IR_VAR_VALUE_TY_VALUE_LIST,
+            var_ty,
+            _1: ir_var_value__bindgen_ty_1 {
+                value_list: ir_var_value_list {
+                    values,
+                    offsets,
+                    num_values,
+                },
+            },
+        };
     }
 }
 
@@ -680,6 +777,21 @@ impl IrOp {
         }
     }
 
+    pub fn mk_addr_glb(&self, glb: IrGlb) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        unsafe {
+            p.ty = IR_OP_TY_ADDR;
+            p.var_ty = IR_VAR_TY_POINTER;
+            p._1.addr = ir_op_addr {
+                ty: IR_OP_ADDR_TY_GLB,
+                _1: ir_op_addr__bindgen_ty_1 {
+                    glb: glb.0.as_ptr(),
+                },
+            };
+        }
+    }
+
     pub fn mk_addr_lcl(&self, lcl: IrLcl) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
@@ -715,11 +827,42 @@ impl IrOp {
 }
 
 impl IrUnit {
+    pub fn add_global_def_var(&self, IrVarTy(var_ty): IrVarTy, name: Option<&str>) -> IrGlb {
+        unsafe {
+            let arena = self.mk_arena();
+            let name = name.map(|n| arena.alloc_str(n)).unwrap_or(ptr::null());
+
+            let unit = self.ptr.as_ptr().as_mut_unchecked();
+
+            let glb = ir_add_global(unit, IR_GLB_TY_DATA, &var_ty, IR_GLB_DEF_TY_DEFINED, name);
+
+            // TODO: linkage
+            (*glb).linkage = IR_LINKAGE_EXTERNAL;
+            (*glb)._1.var = arena.alloc::<ir_var>();
+
+            // FIXME: can sometimes be const data/string
+            let ty = IR_VAR_TY_DATA;
+
+            *(*glb)._1.var = ir_var {
+                unit,
+                ty,
+                var_ty,
+                // TODO: jcc should have raw "bytes" rather than long list type
+                value: ir_var_value {
+                    ty: IR_VAR_VALUE_TY_ZERO,
+                    var_ty,
+                    _1: ir_var_value__bindgen_ty_1 { int_value: 0 },
+                },
+            };
+
+            IrGlb(NonNull::new(glb).unwrap())
+        }
+    }
+
     pub fn add_global_def_func(&self, IrVarTy(var_ty): IrVarTy, name: &str) -> IrGlb {
         unsafe {
-            // FIXME: leak
-            let name = CString::new(name.to_string()).unwrap().into_raw();
-            let arena = ArenaAllocRef::from_raw(self.ptr.as_ref().arena);
+            let arena = self.mk_arena();
+            let name = arena.alloc_str(name);
 
             let unit = self.ptr.as_ptr().as_mut_unchecked();
 
@@ -749,6 +892,40 @@ impl IrUnit {
 pub struct IrVarTy(ir_var_ty);
 
 impl IrVarTy {
+    pub fn ty_none() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_NONE })
+    }
+    pub fn ty_pointer() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_POINTER })
+    }
+
+    pub fn ty_i8() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I8 })
+    }
+    pub fn ty_i16() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I16 })
+    }
+    pub fn ty_i32() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I32 })
+    }
+    pub fn ty_i64() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I64 })
+    }
+    pub fn ty_i128() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_I128 })
+    }
+
+    pub fn ty_f16() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_F16 })
+    }
+    pub fn ty_f32() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_F32 })
+    }
+    pub fn ty_f64() -> IrVarTy {
+        IrVarTy(unsafe { IR_VAR_TY_F64 })
+    }
+    // const F128: Self = Self(unsafe { IR_VAR_TY_F128 });
+
     pub fn is_aggregate(&self) -> bool {
         match self.0.ty {
             IR_VAR_TY_TY_STRUCT | IR_VAR_TY_TY_UNION => true,
