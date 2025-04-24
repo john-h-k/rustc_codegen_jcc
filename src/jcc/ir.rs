@@ -697,6 +697,10 @@ impl AddrOffset {
     }
 }
 
+pub struct IrIntCnst {
+    pub val: u64,
+}
+
 impl IrOp {
     pub fn var_ty(&self) -> IrVarTy {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
@@ -861,9 +865,76 @@ impl IrOp {
         }
     }
 
+    pub fn mk_memset(&self, addr: IrOp, value: u8, length: usize) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_MEM_SET;
+        unsafe {
+            p.var_ty = IR_VAR_TY_NONE;
+        }
+        p._1.mem_set = ir_op_mem_set {
+            addr: addr.as_mut_ptr(),
+            value: value.into(),
+            length,
+        };
+    }
+
+    fn mk_cast<const CAST_TY: u32>(&self, IrVarTy(var_ty): IrVarTy, value: IrOp) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_CAST_OP;
+        p.var_ty = var_ty;
+        p._1.cast_op = ir_op_cast_op {
+            ty: CAST_TY,
+            value: value.as_mut_ptr(),
+        };
+    }
+
+    pub fn mk_trunc(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_TRUNC>(var_ty, value)
+    }
+
+    pub fn mk_sext(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_SEXT>(var_ty, value)
+    }
+
+    pub fn mk_zext(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_ZEXT>(var_ty, value)
+    }
+
+    pub fn mk_conv(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_CONV>(var_ty, value)
+    }
+
+    pub fn mk_sconv(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_SCONV>(var_ty, value)
+    }
+
+    pub fn mk_uconv(&self, var_ty: IrVarTy, value: IrOp) {
+        self.mk_cast::<IR_OP_CAST_OP_TY_UCONV>(var_ty, value)
+    }
+
     fn chk_ty(&self) -> u32 {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         p.ty
+    }
+
+    pub fn get_int_cnst(&self) -> Option<IrIntCnst> {
+        let IR_OP_CNST_TY_INT = self.chk_ty() else {
+            return None;
+        };
+
+        unsafe {
+            let p = self.0.as_ptr().as_mut_unchecked();
+            let cnst = p._1.cnst;
+
+            match cnst.ty {
+                IR_OP_CNST_TY_INT => Some(IrIntCnst {
+                    val: cnst._1.int_value,
+                }),
+                _ => None,
+            }
+        }
     }
 
     pub fn get_addr_glb(&self) -> Option<IrGlb> {

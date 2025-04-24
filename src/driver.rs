@@ -136,6 +136,16 @@ impl<'tcx> CodegenCx<'tcx> {
         stmt.alloc_op()
     }
 
+    pub fn mk_next_op(&self, mk: impl FnOnce(IrOp)) -> IrOp {
+        let bb = self.cur_bb.borrow().unwrap();
+        let stmt = bb.alloc_stmt();
+        let op = stmt.alloc_op();
+
+        mk(op);
+
+        op
+    }
+
     fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
         // TODO: vis/link won't be updated properly in predefine_fn
         let sym = self.tcx.symbol_name(instance).name;

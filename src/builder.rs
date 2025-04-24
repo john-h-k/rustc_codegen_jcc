@@ -13,7 +13,7 @@ use rustc_codegen_ssa::{
         AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes,
         BaseTypeCodegenMethods, BuilderMethods, ConstCodegenMethods, CoverageInfoBuilderMethods,
         DebugInfoBuilderMethods, IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods,
-        MiscCodegenMethods, StaticBuilderMethods,
+        StaticBuilderMethods,
     },
 };
 use rustc_middle::{
@@ -44,6 +44,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     pub fn module(&self) -> JccModule {
         self.cx.module()
+    }
+
+    fn val_to_u64(&self, val: IrOp) -> Option<u64> {
+        val.get_int_cnst().map(|c| c.val)
     }
 }
 
@@ -697,15 +701,6 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn gep(&mut self, ty: Self::Type, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value {
-        todo!()
-    }
-
-    fn inbounds_gep(
-        &mut self,
-        ty: Self::Type,
-        ptr: Self::Value,
-        indices: &[Self::Value],
-    ) -> Self::Value {
         debug_assert!(
             indices.len() == 1,
             "multi-index gep (how do we calculate the other types scales?)",
@@ -721,12 +716,21 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         op
     }
 
+    fn inbounds_gep(
+        &mut self,
+        ty: Self::Type,
+        ptr: Self::Value,
+        indices: &[Self::Value],
+    ) -> Self::Value {
+        self.gep(ty, ptr, indices)
+    }
+
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_trunc(dest_ty, val))
     }
 
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_sext(dest_ty, val))
     }
 
     fn fptoui_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -831,7 +835,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         align: rustc_abi::Align,
         flags: rustc_codegen_ssa::MemFlags,
     ) {
-        todo!()
+        let Some(fill_byte) = self.val_to_u64(fill_byte).and_then(|f| f.try_into().ok()) else {
+            todo!("non cnst fill byte for memset");
+        };
+
+        let Some(size) = self.val_to_u64(size).and_then(|f| f.try_into().ok()) else {
+            todo!("non cnst size for memset");
+        };
+
+        let op = self.alloc_next_op();
+        op.mk_memset(ptr, fill_byte, size);
     }
 
     fn select(

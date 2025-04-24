@@ -3,9 +3,6 @@
 #![feature(f16, alloc_error_hook)]
 #![feature(allocator_api)]
 #![feature(ptr_as_ref_unchecked)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 // #![warn(clippy::pedantic)]
 
 //! rustc_codegen_jcc - a JCC-based backend for rust
