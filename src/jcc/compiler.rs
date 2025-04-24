@@ -32,6 +32,7 @@ impl Compiler {
         unsafe {
             fs_create(arena.as_ptr(), FS_FLAG_ASSUME_CONSTANT, &mut fs);
 
+            // FIXME: target
             let target = &AARCH64_MACOS_TARGET;
             let path = arena.alloc_str(obj_out);
 
