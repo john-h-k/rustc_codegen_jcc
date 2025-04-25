@@ -34,9 +34,9 @@ use smallvec::{SmallVec, smallvec};
 use crate::jcc::{
     alloc::ArenaAlloc,
     ir::{
-        AddrOffset, AsIrRaw, IrBasicBlock, IrFloatTy, IrFunc, IrGlb, IrId, IrIntTy, IrLinkage,
-        IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags, IrVarValue,
-        IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
+        AddrOffset, AsIrRaw, IrBasicBlock, IrCnst, IrFloatTy, IrFunc, IrGlb, IrId, IrIntTy,
+        IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
+        IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
     },
 };
 
@@ -263,34 +263,10 @@ pub struct CodegenCx<'tcx> {
     pub arena: ArenaAlloc,
 
     pub glb_map: RefCell<FxHashMap<String, IrGlb>>,
-    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrOp>>,
-
-    pub cur_bb: RefCell<Option<IrBasicBlock>>,
+    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrBuildValue>>,
 }
 
 impl<'tcx> CodegenCx<'tcx> {
-    pub fn alloc_next_op(&self) -> IrOp {
-        let bb = self.cur_bb.borrow().unwrap();
-        eprintln!("bb {}", bb.id());
-        eprintln!("bb {:?}", bb.as_mut_ptr());
-        eprintln!("{} stmts", bb.stmts().len());
-        let stmt = bb.alloc_stmt();
-        eprintln!(
-            "{} stmts new id {}",
-            bb.stmts().len(),
-            bb.last().unwrap().id()
-        );
-        stmt.alloc_op()
-    }
-
-    pub fn mk_next_op(&self, mk: impl FnOnce(IrOp)) -> IrOp {
-        let op = self.alloc_next_op();
-
-        mk(op);
-
-        op
-    }
-
     fn try_get_glb_by_name(&self, name: &str) -> Option<IrGlb> {
         self.glb_map.borrow_mut().get(name).copied()
     }
@@ -298,10 +274,6 @@ impl<'tcx> CodegenCx<'tcx> {
     fn try_get_glb(&self, instance: Instance<'tcx>) -> Option<IrGlb> {
         let sym = self.tcx.symbol_name(instance).name;
         self.try_get_glb_by_name(sym)
-    }
-
-    fn set_cur_bb(&self, bb: IrBasicBlock) {
-        *self.cur_bb.borrow_mut() = Some(bb)
     }
 
     fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
@@ -465,8 +437,41 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 }
 
+// values can be created outside the context of a function (sigh)
+// so we need a flexible way to represent them
+#[derive(Debug, Clone, Copy)]
+pub enum IrBuildValue {
+    Cnst(IrCnst),
+    Op(IrOp),
+    GlbAddr(IrGlb),
+}
+
+impl From<IrOp> for IrBuildValue {
+    fn from(value: IrOp) -> Self {
+        Self::Op(value)
+    }
+}
+
+impl PartialEq for IrBuildValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (IrBuildValue::Op(l), IrBuildValue::Op(r)) => l == r,
+            _ => panic!("other eqs"),
+        }
+    }
+}
+
+impl IrBuildValue {
+    pub fn var_ty(&self) -> IrVarTy {
+        match self {
+            IrBuildValue::Cnst(IrCnst { var_ty, .. }) => *var_ty,
+            IrBuildValue::Op(ir_op) => ir_op.var_ty(),
+        }
+    }
+}
+
 impl<'tcx> BackendTypes for CodegenCx<'tcx> {
-    type Value = IrOp;
+    type Value = IrBuildValue;
     type Metadata = ();
     type Function = IrFunc;
     type BasicBlock = IrBasicBlock;
@@ -1284,7 +1289,6 @@ impl<'tcx> CodegenCx<'tcx> {
             unit,
             glb_map,
             vtables,
-            cur_bb: RefCell::new(None),
         }
     }
 

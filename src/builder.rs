@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     num::NonZeroUsize,
     ops::{Deref, Range},
 };
@@ -35,33 +36,69 @@ use rustc_type_ir::TyKind::FnDef;
 
 use crate::{
     CodegenCx, JccModule,
-    driver::ty_to_jcc_ty,
+    driver::{IrBuildValue, ty_to_jcc_ty},
     jcc::ir::{
-        AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrFunc, IrOp, IrUnOpTy,
-        IrVarTy,
+        AddrOffset, AsIrRaw, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrCnstTy, IrFunc,
+        IrId, IrOp, IrUnOpTy, IrVarTy,
     },
 };
 
 pub struct Builder<'a, 'tcx> {
     cx: &'a CodegenCx<'tcx>,
+    cur_bb: RefCell<Option<IrBasicBlock>>,
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     pub fn with_cx(cx: &'a CodegenCx<'tcx>) -> Self {
-        Self { cx }
+        Self {
+            cx,
+            cur_bb: RefCell::new(None),
+        }
     }
 
     pub fn module(&self) -> JccModule {
         self.cx.module()
     }
 
-    fn val_to_u64(&self, val: IrOp) -> Option<u64> {
-        val.get_int_cnst().map(|c| c.val)
+    pub fn alloc_next_op(&self) -> IrOp {
+        let bb = self.cur_bb.borrow().unwrap();
+        eprintln!("bb {}", bb.id());
+        eprintln!("bb {:?}", bb.as_mut_ptr());
+        eprintln!("{} stmts", bb.stmts().len());
+        let stmt = bb.alloc_stmt();
+        eprintln!(
+            "{} stmts new id {}",
+            bb.stmts().len(),
+            bb.last().unwrap().id()
+        );
+        stmt.alloc_op()
+    }
+
+    pub fn mk_next_op(&self, mk: impl FnOnce(IrOp)) -> IrOp {
+        let op = self.alloc_next_op();
+
+        mk(op);
+
+        op
+    }
+
+    fn set_cur_bb(&self, bb: IrBasicBlock) {
+        *self.cur_bb.borrow_mut() = Some(bb)
+    }
+
+    fn val_to_u64(&self, val: IrBuildValue) -> Option<u64> {
+        match val {
+            IrBuildValue::Cnst(ir_cnst) => match ir_cnst.cnst {
+                IrCnstTy::Int(val) => Some(val),
+                IrCnstTy::Float(_) => None,
+            },
+            IrBuildValue::Op(ir_op) => ir_op.get_int_cnst().map(|c| c.val),
+        }
     }
 }
 
 impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
-    type Value = IrOp;
+    type Value = IrBuildValue;
 
     type Metadata = ();
     type Function = IrFunc;
@@ -169,7 +206,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 
 impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
     fn get_param(&mut self, index: usize) -> Self::Value {
-        self.cur_bb.borrow().unwrap().func().get_param_op(index)
+        self.cur_bb
+            .borrow()
+            .unwrap()
+            .func()
+            .get_param_op(index)
+            .into()
     }
 }
 
@@ -202,7 +244,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         };
 
         let op = stmt.alloc_op();
-        op.mk_store_addr(addr, value);
+        op.mk_store_addr(addr.op(), value);
     }
 
     fn store_arg(
@@ -346,14 +388,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
         let bb = llfn.alloc_basicblock();
 
-        *cx.cur_bb.borrow_mut() = Some(bb);
-
         bb.comment(name.as_bytes());
         bb
     }
 
     fn append_sibling_block(&mut self, name: &str) -> Self::BasicBlock {
-        let cur = &self.cx.cur_bb.borrow().unwrap();
+        let cur = &self.cur_bb.borrow().unwrap();
         let bb = cur.func().alloc_basicblock();
 
         bb.comment(name.as_bytes());
@@ -374,7 +414,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         bb.mk_ty(IrBasicBlockTy::Ret);
 
         let op = self.alloc_next_op();
-        op.mk_ret(Some(v));
+        op.mk_ret(Some(v.op()));
     }
 
     fn br(&mut self, dest: Self::BasicBlock) {
@@ -398,7 +438,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         });
 
         let op = self.alloc_next_op();
-        op.mk_cond_br(cond);
+        op.mk_cond_br(cond.op());
     }
 
     fn switch(
@@ -431,109 +471,130 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn add(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Add, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Add, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fadd_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fadd_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn sub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sub, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sub, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fsub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fsub_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fsub_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn mul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Mul, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Mul, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fmul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fmul_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fmul_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn udiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn exactudiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         // FIXME: what is this op?
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn sdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn exactsdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         // FIXME: what is this op?
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fdiv_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fdiv_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn urem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Umod, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Umod, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn srem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Smod, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Smod, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn frem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
@@ -550,47 +611,56 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn shl(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Lshift, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Lshift, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn lshr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Urshift, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Urshift, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn ashr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Srshift, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Srshift, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn and(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::And, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::And, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn or(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Or, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Or, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn xor(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Xor, var_ty, lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Xor, var_ty, lhs.op(), rhs.op()))
+            .into()
     }
 
     fn neg(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Neg, var_ty, v))
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Neg, var_ty, v.op()))
+            .into()
     }
 
     fn fneg(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Fneg, var_ty, v))
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Fneg, var_ty, v.op()))
+            .into()
     }
 
     fn not(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Not, var_ty, v))
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Not, var_ty, v.op()))
+            .into()
     }
 
     fn checked_binop(
@@ -633,7 +703,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let op = self.alloc_next_op();
         op.mk_addr_lcl(lcl);
 
-        op
+        op.into()
     }
 
     fn dynamic_alloca(&mut self, size: Self::Value, align: rustc_abi::Align) -> Self::Value {
@@ -641,7 +711,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: rustc_abi::Align) -> Self::Value {
-        self.mk_next_op(|op| op.mk_load_addr(ty, ptr))
+        self.mk_next_op(|op| op.mk_load_addr(ty, ptr.op())).into()
     }
 
     fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value {
@@ -743,7 +813,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ptr: Self::Value,
         align: rustc_abi::Align,
     ) -> Self::Value {
-        self.mk_next_op(|op| op.mk_store_addr(ptr, val))
+        self.mk_next_op(|op| op.mk_store_addr(ptr.op(), val.op()))
+            .into()
     }
 
     fn store_with_flags(
@@ -783,8 +854,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let scale = NonZeroUsize::new(scale).unwrap();
 
         let op = self.alloc_next_op();
-        op.mk_addr_offset(AddrOffset::index(base, index, scale));
-        op
+        op.mk_addr_offset(AddrOffset::index(base.op(), index.op(), scale));
+        op.into()
     }
 
     fn inbounds_gep(
@@ -797,15 +868,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_trunc(dest_ty, val))
+        self.mk_next_op(|op| op.mk_trunc(dest_ty, val.op())).into()
     }
 
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sext(dest_ty, val))
+        self.mk_next_op(|op| op.mk_sext(dest_ty, val.op())).into()
     }
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_zext(dest_ty, val))
+        self.mk_next_op(|op| op.mk_zext(dest_ty, val.op())).into()
     }
 
     fn fptoui_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -817,27 +888,27 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn fptoui(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_uconv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_uconv(dest_ty, val.op())).into()
     }
 
     fn fptosi(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sconv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_sconv(dest_ty, val.op())).into()
     }
 
     fn uitofp(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_uconv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_uconv(dest_ty, val.op())).into()
     }
 
     fn sitofp(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sconv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_sconv(dest_ty, val.op())).into()
     }
 
     fn fptrunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_conv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_conv(dest_ty, val.op())).into()
     }
 
     fn fpext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_conv(dest_ty, val))
+        self.mk_next_op(|op| op.mk_conv(dest_ty, val.op())).into()
     }
 
     fn ptrtoint(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -881,7 +952,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             IntPredicate::IntSLE => IrBinOpTy::Slteq,
         };
 
-        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs.op(), rhs.op()))
+            .into()
     }
 
     fn fcmp(&mut self, op: RealPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
@@ -905,7 +977,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             RealPredicate::RealUNE => IrBinOpTy::Fneq,
         };
 
-        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs, rhs))
+        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs.op(), rhs.op()))
+            .into()
     }
 
     fn memcpy(
@@ -924,7 +997,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let size = size.try_into().expect("u64 -> usize fail");
 
         let op = self.alloc_next_op();
-        op.mk_memcpy(src, dst, size);
+        op.mk_memcpy(src.op(), dst.op(), size);
     }
 
     fn memmove(
@@ -956,7 +1029,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
 
         let op = self.alloc_next_op();
-        op.mk_memset(ptr, fill_byte, size);
+        op.mk_memset(ptr.op(), fill_byte, size);
     }
 
     fn select(
@@ -1089,10 +1162,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
         };
 
-        dbg!(&args);
-        let op = self.mk_next_op(|op| op.mk_call(llty, llfn, args, ret));
-        dbg!(op);
-        op
+        let args = args.into_iter().map(|a| a.op()).collect::<Vec<_>>();
+
+        let op = self.mk_next_op(|op| op.mk_call(llty, llfn.op(), &args, ret));
+        op.into()
     }
 
     fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value) {

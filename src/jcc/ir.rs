@@ -836,6 +836,18 @@ impl<T: Into<u64>> From<T> for IrIntCnst {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IrCnst {
+    pub var_ty: IrVarTy,
+    pub cnst: IrCnstTy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IrCnstTy {
+    Int(u64),
+    Float(f64),
+}
+
 #[repr(u32)]
 pub enum IrUnOpTy {
     Fneg = IR_OP_UNARY_OP_TY_FNEG,
