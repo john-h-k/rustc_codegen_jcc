@@ -3,7 +3,6 @@ use std::{
     ptr::{self},
 };
 
-
 use crate::jcc_sys::*;
 
 use super::{
@@ -36,7 +35,8 @@ impl Compiler {
                 output,
                 args: compile_ir_args {
                     target: COMPILE_TARGET_MACOS_ARM64,
-                    log_flags: COMPILE_LOG_FLAGS_ALL,
+                    // log_flags: COMPILE_LOG_FLAGS_ALL,
+                    log_flags: COMPILE_LOG_FLAGS_NONE,
                     opts_level: COMPILE_OPTS_LEVEL_0,
                     // codegen_flags: CODEGEN_FLAG_ABI_LOWERED,
                     codegen_flags: CODEGEN_FLAG_NONE,

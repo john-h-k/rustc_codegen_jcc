@@ -9,7 +9,6 @@ use std::{
     slice,
 };
 
-
 use crate::jcc_sys::*;
 
 fn chk_null_safe(bytes: &[u8]) {
@@ -104,6 +103,18 @@ impl ArenaAllocRef {
         }
 
         ptr.cast::<c_char>()
+    }
+
+    pub fn alloc_slice<T>(&self, len: usize) -> *mut T {
+        if len == 0 {
+            return NonNull::dangling().as_ptr();
+        }
+
+        let sz = mem::size_of::<T>() * len;
+        let ptr = self.alloc_raw(sz).cast::<u8>();
+        let ptr = NonNull::as_ptr(ptr);
+
+        ptr.cast::<T>()
     }
 
     pub fn alloc_slice_copy<T>(&self, slice: &[T]) -> *mut T {

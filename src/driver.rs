@@ -1,34 +1,42 @@
-use std::{cell::RefCell, num::NonZeroUsize, ops::Range};
+use std::{cell::RefCell, fmt::Write, num::NonZeroUsize, ops::Range};
 
-use rustc_abi::{FieldsShape, HasDataLayout};
+use rustc_abi::{
+    BackendRepr, FieldsShape, Float, HasDataLayout, Integer, Primitive, Scalar, Variants,
+    WrappingRange,
+};
 use rustc_codegen_ssa::traits::{
     AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods, ConstCodegenMethods,
     DebugInfoCodegenMethods, LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
     StaticCodegenMethods, TypeMembershipCodegenMethods,
 };
 use rustc_const_eval::interpret::{
-    self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, read_target_uint,
+    self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, Pointer, read_target_uint,
 };
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::{
     bug,
     mir::mono::{CodegenUnit, Linkage, Visibility},
     ty::{
-        self, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
-        layout::{FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout},
+        self, CoroutineArgsExt, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
+        layout::{
+            FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers,
+            TyAndLayout,
+        },
+        print::with_no_trimmed_paths,
     },
 };
 use rustc_session::Session;
 use rustc_span::{Symbol, def_id::DefId};
 use rustc_target::callconv::{ArgAbi, CastTarget, FnAbi, PassMode};
-use rustc_type_ir::{FloatTy, IntTy, UintTy};
+use rustc_type_ir::{FloatTy, IntTy, TypeVisitableExt, UintTy};
 use smallvec::{SmallVec, smallvec};
 
 use crate::jcc::{
-    alloc::{ArenaAlloc, ArenaAllocRef},
+    alloc::ArenaAlloc,
     ir::{
-        AddrOffset, IrBasicBlock, IrBytes, IrFloatTy, IrFunc, IrGlb, IrIntTy, IrOp, IrUnit,
-        IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
+        AddrOffset, AsIrRaw, IrBasicBlock, IrFloatTy, IrFunc, IrGlb, IrId, IrIntTy, IrLinkage,
+        IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags, IrVarValue,
+        IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
     },
 };
 
@@ -50,44 +58,193 @@ trait TypedDebug: Debug {
 
 impl<T: ?Sized + Debug> TypedDebug for T {}
 
-fn ty_to_jcc_ty<'tcx>(tcx: TyCtxt<'tcx>, unit: &IrUnit, ty: &TyAndLayout<'tcx>) -> IrVarTy {
-    let TyAndLayout { ty, layout } = ty;
+pub fn integer_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, integer: rustc_abi::Integer) -> IrVarTy {
+    match integer {
+        Integer::I8 => cx.type_i8(),
+        Integer::I16 => cx.type_i16(),
+        Integer::I32 => cx.type_i32(),
+        Integer::I64 => cx.type_i64(),
+        Integer::I128 => cx.type_i128(),
+    }
+}
 
-    match ty.kind() {
-        TyKind::Never => unit.var_ty_none(),
-        TyKind::Tuple(tys) if tys.is_empty() => unit.var_ty_none(),
-        TyKind::Bool => unit.var_ty_integer(IrIntTy::I1),
-        TyKind::Int(IntTy::I8) | TyKind::Uint(UintTy::U8) => unit.var_ty_integer(IrIntTy::I8),
-        TyKind::Char => unit.var_ty_integer(IrIntTy::I32),
-        TyKind::Int(IntTy::I16) | TyKind::Uint(UintTy::U16) => unit.var_ty_integer(IrIntTy::I16),
-        TyKind::Int(IntTy::I32) | TyKind::Uint(UintTy::U32) => unit.var_ty_integer(IrIntTy::I32),
-        TyKind::Int(IntTy::I64) | TyKind::Uint(UintTy::U64) => unit.var_ty_integer(IrIntTy::I64),
-        // FIXME: should be ptr-sized int
-        TyKind::Int(IntTy::Isize) | TyKind::Uint(UintTy::Usize) => unit.var_ty_pointer(),
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => unit.var_ty_integer(IrIntTy::I128),
-        TyKind::Float(FloatTy::F16) => unit.var_ty_float(IrFloatTy::F16),
-        TyKind::Float(FloatTy::F32) => unit.var_ty_float(IrFloatTy::F32),
-        TyKind::Float(FloatTy::F64) => unit.var_ty_float(IrFloatTy::F64),
-        TyKind::Float(FloatTy::F128) => todo!("f128"),
-        TyKind::FnPtr(..) => unit.var_ty_pointer(),
-        TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
-            if tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()) {
-                // is this correct? metadata type = { ptr, ptr }?
+pub fn float_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, float: rustc_abi::Float) -> IrVarTy {
+    match float {
+        Float::F16 => cx.type_f16(),
+        Float::F32 => cx.type_f32(),
+        Float::F64 => cx.type_f64(),
+        Float::F128 => cx.type_f128(),
+    }
+}
 
-                let FieldsShape::Arbitrary {
-                    offsets,
-                    memory_index,
-                } = layout.fields()
-                else {
-                    bug!()
-                };
+pub fn scalar_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, scalar: &rustc_abi::Scalar) -> IrVarTy {
+    match scalar.primitive() {
+        Primitive::Int(integer, _) => integer_ty_to_jcc_ty(cx, integer),
+        Primitive::Float(float) => float_ty_to_jcc_ty(cx, float),
+        Primitive::Pointer(address_space) => cx.type_ptr_ext(address_space),
+    }
+}
 
-                dbg!(unit.var_ty_fat_pointer())
-            } else {
-                unit.var_ty_pointer()
-            }
+fn struct_fields<'tcx>(cx: &CodegenCx<'tcx>, layout: &TyAndLayout<'tcx>) -> (Vec<IrVarTy>, bool) {
+    let field_count = layout.fields.count();
+    let mut packed = false;
+    let mut offset = rustc_abi::Size::ZERO;
+    let mut prev_effective_align = layout.align.abi;
+    let mut result: Vec<_> = Vec::with_capacity(1 + field_count * 2);
+
+    for i in layout.fields.index_by_increasing_offset() {
+        let target_offset = layout.fields.offset(i);
+        let field = layout.field(cx, i);
+        let effective_field_align = layout
+            .align
+            .abi
+            .min(field.align.abi)
+            .restrict_for_offset(target_offset);
+
+        packed |= effective_field_align < field.align.abi;
+        assert!(target_offset >= offset);
+
+        let padding = target_offset - offset;
+        let padding_align = prev_effective_align.min(effective_field_align);
+
+        assert_eq!(offset.align_to(padding_align) + padding, target_offset);
+
+        result.push(cx.type_padding_filler(padding, padding_align));
+        result.push(ty_to_jcc_ty(cx, &field));
+
+        offset = target_offset + field.size;
+        prev_effective_align = effective_field_align;
+    }
+
+    if layout.is_sized() && field_count > 0 {
+        if offset > layout.size {
+            bug!(
+                "layout: {:#?} stride: {:?} offset: {:?}",
+                layout,
+                layout.size,
+                offset
+            );
         }
-        _ => panic!("bad ty {ty:?}, {:?}", ty.kind().typed_debug()),
+
+        let padding = layout.size - offset;
+        let padding_align = prev_effective_align;
+
+        assert_eq!(offset.align_to(padding_align) + padding, layout.size);
+
+        result.push(cx.type_padding_filler(padding, padding_align));
+
+        assert_eq!(result.len(), 1 + field_count * 2);
+    }
+
+    (result, packed)
+}
+
+pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -> IrVarTy {
+    let TyAndLayout { ty, layout } = &ty_layout;
+
+    // TODO: caching
+    // read comments in gcc impl because there are useful details - `rust-lang/rustc_codegen_gcc src/type_of.rs gcc_type`
+
+    if let BackendRepr::Scalar(ref scalar) = layout.backend_repr {
+        let var_ty = match *ty.kind() {
+            ty::FnPtr(sig_tys, hdr) => {
+                cx.fn_ptr_backend_type(cx.fn_abi_of_fn_ptr(sig_tys.with(hdr), ty::List::empty()))
+            }
+            _ => scalar_ty_to_jcc_ty(cx, scalar),
+        };
+
+        return var_ty;
+    }
+
+    assert!(
+        !ty.has_escaping_bound_vars(),
+        "{:?} has escaping bound vars",
+        ty
+    );
+
+    // Make sure lifetimes are erased, to avoid generating distinct LLVM
+    // types for Rust types that only differ in the choice of lifetimes.
+    let normal_ty = cx.tcx.erase_regions(*ty);
+
+    if *ty != normal_ty {
+        let mut layout = cx.layout_of(normal_ty);
+
+        ty_to_jcc_ty(cx, &layout)
+    } else {
+        match layout.backend_repr {
+            BackendRepr::Scalar(_) => bug!("handled elsewhere"),
+            BackendRepr::SimdVector { ref element, count } => {
+                todo!("SimdVector");
+            }
+            BackendRepr::ScalarPair(l, r) => {
+                return cx.type_struct(
+                    &[scalar_ty_to_jcc_ty(cx, &l), scalar_ty_to_jcc_ty(cx, &r)],
+                    false,
+                );
+            }
+            BackendRepr::Memory { .. } => {}
+        }
+
+        let name = match *ty.kind() {
+            ty::Adt(..)
+            | ty::Closure(..)
+            | ty::CoroutineClosure(..)
+            | ty::Foreign(..)
+            | ty::Coroutine(..)
+            | ty::Str
+                if !cx.sess().fewer_names() =>
+            {
+                let mut name = with_no_trimmed_paths!(ty.to_string());
+
+                if let (&ty::Adt(def, _), &Variants::Single { index }) =
+                    (ty.kind(), &layout.variants)
+                {
+                    if def.is_enum() && !def.variants().is_empty() {
+                        write!(&mut name, "::{}", def.variant(index).name).unwrap();
+                    }
+                }
+                if let (&ty::Coroutine(_, _), &Variants::Single { index }) =
+                    (ty.kind(), &layout.variants)
+                {
+                    write!(&mut name, "::{}", ty::CoroutineArgs::variant_name(index)).unwrap();
+                }
+
+                Some(name)
+            }
+            ty::Adt(..) => Some(String::new()),
+            _ => None,
+        };
+
+        match layout.fields {
+            FieldsShape::Primitive | FieldsShape::Union(_) => {
+                let fill = cx.type_padding_filler(layout.size, layout.align.abi);
+                let packed = false;
+                match name {
+                    None => cx.type_struct(&[fill], packed),
+                    Some(ref name) => {
+                        // TODO: can we use the name here to get more aliasing info?
+
+                        cx.type_struct(&[fill], packed)
+                    }
+                }
+            }
+            FieldsShape::Array { count, .. } => {
+                let el_ty = ty_to_jcc_ty(cx, &ty_layout.field(cx, 0));
+                cx.type_array(el_ty, count)
+            }
+            FieldsShape::Arbitrary { .. } => match name {
+                None => {
+                    let (fields, packed) = struct_fields(cx, ty_layout);
+                    cx.type_struct(&fields, packed)
+                }
+                Some(ref name) => {
+                    // TODO: can we use the name here to get more aliasing info?
+
+                    let (fields, packed) = struct_fields(cx, ty_layout);
+                    cx.type_struct(&fields, packed)
+                }
+            },
+        }
     }
 }
 
@@ -100,10 +257,12 @@ unsafe impl Sync for JccModule {}
 
 pub struct CodegenCx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    // not present for codegen_allocator
+    pub cg_unit: Option<&'tcx CodegenUnit<'tcx>>,
     pub unit: IrUnit,
     pub arena: ArenaAlloc,
 
-    pub fn_map: RefCell<FxHashMap<Instance<'tcx>, IrGlb>>,
+    pub glb_map: RefCell<FxHashMap<String, IrGlb>>,
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrOp>>,
 
     pub cur_bb: RefCell<Option<IrBasicBlock>>,
@@ -112,18 +271,37 @@ pub struct CodegenCx<'tcx> {
 impl<'tcx> CodegenCx<'tcx> {
     pub fn alloc_next_op(&self) -> IrOp {
         let bb = self.cur_bb.borrow().unwrap();
+        eprintln!("bb {}", bb.id());
+        eprintln!("bb {:?}", bb.as_mut_ptr());
+        eprintln!("{} stmts", bb.stmts().len());
         let stmt = bb.alloc_stmt();
+        eprintln!(
+            "{} stmts new id {}",
+            bb.stmts().len(),
+            bb.last().unwrap().id()
+        );
         stmt.alloc_op()
     }
 
     pub fn mk_next_op(&self, mk: impl FnOnce(IrOp)) -> IrOp {
-        let bb = self.cur_bb.borrow().unwrap();
-        let stmt = bb.alloc_stmt();
-        let op = stmt.alloc_op();
+        let op = self.alloc_next_op();
 
         mk(op);
 
         op
+    }
+
+    fn try_get_glb_by_name(&self, name: &str) -> Option<IrGlb> {
+        self.glb_map.borrow_mut().get(name).copied()
+    }
+
+    fn try_get_glb(&self, instance: Instance<'tcx>) -> Option<IrGlb> {
+        let sym = self.tcx.symbol_name(instance).name;
+        self.try_get_glb_by_name(sym)
+    }
+
+    fn set_cur_bb(&self, bb: IrBasicBlock) {
+        *self.cur_bb.borrow_mut() = Some(bb)
     }
 
     fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
@@ -139,7 +317,7 @@ impl<'tcx> CodegenCx<'tcx> {
             &ret,
         );
 
-        self.fn_map.borrow_mut().insert(instance, glb);
+        self.glb_map.borrow_mut().insert(sym.to_string(), glb);
         glb
     }
 
@@ -150,10 +328,10 @@ impl<'tcx> CodegenCx<'tcx> {
         let unit = self.unit;
         let ty = unit.var_ty_bytes(alloc.len());
 
-        let glb = unit.add_global_def_var(ty, None);
+        let glb = unit.add_global_def_var(ty, None, IrLinkage::Internal);
         let var = glb.var();
 
-        let mut llvals = Vec::with_capacity_in(alloc.provenance().ptrs().len() + 1, arena);
+        let mut llvals = Vec::with_capacity(alloc.provenance().ptrs().len() + 1);
 
         let dl = self.data_layout();
         let pointer_size = dl.pointer_size.bytes() as usize;
@@ -162,7 +340,7 @@ impl<'tcx> CodegenCx<'tcx> {
         // must be within the bounds of `alloc` and not contain or overlap a pointer provenance.
         fn append_chunks_of_init_and_uninit_bytes<'a, 'b>(
             cx: &'a CodegenCx<'b>,
-            llvals: &mut Vec<IrBytes<'a>, &ArenaAllocRef>,
+            llvals: &mut Vec<IrVarValueListEl>,
             alloc: &'a Allocation,
             range: Range<usize>,
         ) {
@@ -174,7 +352,10 @@ impl<'tcx> CodegenCx<'tcx> {
                     let range = (range.start.bytes() as usize)..(range.end.bytes() as usize);
                     let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
 
-                    Some(IrBytes::new(offset, bytes))
+                    Some(IrVarValueListEl {
+                        offset,
+                        value: IrVarValue::from_bytes(cx.unit, offset, bytes),
+                    })
                 }
                 InitChunk::Uninit(range) => {
                     // do nothing, all ranges outside of value lists are uninit
@@ -195,9 +376,13 @@ impl<'tcx> CodegenCx<'tcx> {
             } else {
                 // If this allocation contains any uninit bytes, codegen as if it was initialized
                 // (using some arbitrary value for uninit bytes).
+
                 let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
-                // llvals.push(cx.const_bytes(bytes));
-                llvals.push(IrBytes::new(offset, bytes));
+
+                llvals.push(IrVarValueListEl {
+                    offset,
+                    value: IrVarValue::from_bytes(cx.unit, offset, bytes),
+                });
             }
         }
 
@@ -231,20 +416,19 @@ impl<'tcx> CodegenCx<'tcx> {
 
             let address_space = self.tcx.global_alloc(prov.alloc_id()).address_space(self);
 
-            // self.scalar_to_var_value(
-            //     interpret::Scalar::from_pointer(
-            //         Pointer::new(prov, rustc_abi::Size::from_bytes(ptr_offset)),
-            //         &self.tcx,
-            //     ),
-            //     Scalar::Initialized {
-            //         value: Primitive::Pointer(address_space),
-            //         valid_range: WrappingRange::full(dl.pointer_size),
-            //     },
-            //     self.type_ptr_ext(address_space),
-            // );
+            self.scalar_to_var_value(
+                interpret::Scalar::from_pointer(
+                    Pointer::new(prov, rustc_abi::Size::from_bytes(ptr_offset)),
+                    &self.tcx,
+                ),
+                Scalar::Initialized {
+                    value: Primitive::Pointer(address_space),
+                    valid_range: WrappingRange::full(dl.pointer_size),
+                },
+                self.type_ptr_ext(address_space),
+            );
 
             next_offset = offset + pointer_size;
-            todo!("ptr relocs");
         }
 
         if alloc.len() >= next_offset {
@@ -255,7 +439,12 @@ impl<'tcx> CodegenCx<'tcx> {
             append_chunks_of_init_and_uninit_bytes(self, &mut llvals, alloc, range);
         }
 
-        var.mk_const_bytes(ty, &llvals[..]);
+        let value = IrVarValue {
+            ty: IrVarValueTy::List(llvals),
+            var_ty: ty,
+        };
+
+        var.mk_value(&value);
         glb
     }
 }
@@ -333,8 +522,37 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
 }
 
 impl CodegenCx<'_> {
+    pub fn type_none(&self) -> IrVarTy {
+        IrVarTy::ty_none()
+    }
+
     pub fn type_i1(&self) -> IrVarTy {
         IrVarTy::ty_i1()
+    }
+
+    pub fn type_struct(&self, fields: &[IrVarTy], packed: bool) -> IrVarTy {
+        if packed {
+            todo!("packed structs");
+        }
+
+        self.unit.var_ty_struct(fields)
+    }
+
+    pub fn type_union(&self, fields: &[IrVarTy]) -> IrVarTy {
+        self.unit.var_ty_union(fields)
+    }
+
+    pub fn type_padding_filler(&self, size: rustc_abi::Size, align: rustc_abi::Align) -> IrVarTy {
+        let unit = Integer::approximate_align(self, align);
+
+        let size = size.bytes();
+        let unit_size = unit.size().bytes();
+
+        assert_eq!(size % unit_size, 0);
+
+        let unit = integer_ty_to_jcc_ty(self, unit);
+
+        self.type_array(unit, size / unit_size)
     }
 }
 
@@ -454,25 +672,47 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn codegen_unit(&self) -> &'tcx CodegenUnit<'tcx> {
-        todo!()
+        self.cg_unit.unwrap()
     }
 
     fn set_frame_pointer_type(&self, llfn: Self::Function) {
-        todo!()
+        // TODO:
     }
 
     fn apply_target_cpu_attr(&self, llfn: Self::Function) {
-        todo!()
+        // TODO:
     }
 
     fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function> {
-        todo!()
+        let entry_name = self.sess().target.entry_name.as_ref();
+
+        let argv_argc = [self.type_i32(), self.type_ptr()];
+        let ret_code = self.type_i32();
+
+        let func = self.declare_simple_fn(
+            true,
+            Linkage::External,
+            Visibility::Hidden,
+            entry_name,
+            &argv_argc[..],
+            &ret_code,
+        );
+
+        // NOTE: it is needed to set the current_func here as well, because get_fn() is not called
+        // for the main function.
+
+        // FIXME: have cur_fun + cur_bb not just bb (or something)
+        let bb = func.func().last().unwrap();
+
+        self.set_cur_bb(bb);
+
+        Some(func.func())
     }
 }
 
 impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        ty_to_jcc_ty(self.tcx, &self.unit, &layout)
+        ty_to_jcc_ty(self, &layout)
     }
 
     fn cast_backend_type(&self, ty: &CastTarget) -> Self::Type {
@@ -486,7 +726,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn fn_ptr_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type {
-        todo!()
+        self.type_ptr_ext(self.data_layout().instruction_address_space)
     }
 
     fn reg_backend_type(&self, ty: &rustc_abi::Reg) -> Self::Type {
@@ -494,7 +734,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        ty_to_jcc_ty(self.tcx, &self.unit, &layout)
+        ty_to_jcc_ty(self, &layout)
     }
 
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
@@ -506,6 +746,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 | TyKind::Uint(..)
                 | TyKind::Float(..)
                 | TyKind::RawPtr(..)
+                | TyKind::FnPtr(..)
                 | TyKind::Ref(..)
         )
     }
@@ -539,43 +780,52 @@ impl<'tcx> TypeMembershipCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn set_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
 }
 
-// impl<'tcx> CodegenCx<'tcx> {
-// fn scalar_to_var_value(
-//     &self,
-//     cv: interpret::Scalar,
-//     layout: rustc_abi::Scalar,
-//     llty: IrVarTy,
-// ) -> () {
-//     match cv {
-//         interpret::Scalar::Int(scalar_int) => {
-//             // TODO: handle properly
-//             let value = scalar_int.to_bits_unchecked() as u64;
+impl<'tcx> CodegenCx<'tcx> {
+    fn scalar_to_var_value(
+        &self,
+        cv: interpret::Scalar,
+        layout: rustc_abi::Scalar,
+        llty: IrVarTy,
+    ) -> IrVarValue {
+        match cv {
+            interpret::Scalar::Int(scalar_int) => {
+                // TODO: handle properly
+                let value = scalar_int.to_bits_unchecked() as u64;
 
-//             let op = self.alloc_next_op();
-//             op.mk_cnst_int(llty, value);
-//             op
-//         }
-//         interpret::Scalar::Ptr(ptr, _size) => {
-//             let (prov, offset) = ptr.into_parts();
-//             let global_alloc = self.tcx.global_alloc(prov.alloc_id());
-//             match global_alloc {
-//                 GlobalAlloc::Function { instance } => {
-//                     let glb = self.get_glb(instance);
+                IrVarValue {
+                    ty: IrVarValueTy::Int(value.into()),
+                    var_ty: llty,
+                }
+            }
+            interpret::Scalar::Ptr(ptr, _size) => {
+                let (prov, offset) = ptr.into_parts();
+                let global_alloc = self.tcx.global_alloc(prov.alloc_id());
 
-//                     let op = self.alloc_next_op();
-//                     op.mk_addr_glb(glb);
-//                     op
-//                 }
-//                 GlobalAlloc::VTable(ty, raw_list) => todo!(),
-//                 GlobalAlloc::Static(def_id) => todo!(),
-//                 GlobalAlloc::Memory(const_allocation) => {
-//                     let glb = self.alloc_bytes_var(&const_allocation);
-//                 }
-//             }
-//         }
-//     }
-// }
-// }
+                match global_alloc {
+                    GlobalAlloc::Function { instance } => {
+                        let glb = self.get_glb(instance);
+
+                        IrVarValue {
+                            ty: IrVarValueTy::Addr(IrVarValueAddr { glb, offset: 0 }),
+                            var_ty: llty,
+                        }
+                    }
+                    GlobalAlloc::VTable(ty, raw_list) => todo!(),
+                    GlobalAlloc::Static(def_id) => todo!(),
+                    GlobalAlloc::Memory(const_allocation) => {
+                        // FIXME: does this cause recursion if self ref (do we need to do "get or create")?
+                        let glb = self.alloc_bytes_var(&const_allocation);
+
+                        IrVarValue {
+                            ty: IrVarValueTy::Addr(IrVarValueAddr { glb, offset: 0 }),
+                            var_ty: llty,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     fn const_null(&self, t: Self::Type) -> Self::Value {
@@ -583,67 +833,70 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_undef(&self, t: Self::Type) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_undf(t))
     }
 
     fn const_poison(&self, t: Self::Type) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_undf(t))
     }
 
     fn const_bool(&self, val: bool) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i1(), if val { 1 } else { 0 }))
     }
 
+    // TODO: check cast logic for all these
+
     fn const_i8(&self, i: i8) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i8(), i as _))
     }
 
     fn const_i16(&self, i: i16) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i16(), i as _))
     }
 
     fn const_i32(&self, i: i32) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i32(), i as _))
     }
 
     fn const_int(&self, t: Self::Type, i: i64) -> Self::Value {
-        todo!()
+        // what does int mean here?
+        self.mk_next_op(|op| op.mk_cnst_int(t, i as _))
     }
 
     fn const_u8(&self, i: u8) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i8(), i as _))
     }
 
     fn const_u32(&self, i: u32) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i32(), i as _))
     }
 
     fn const_u64(&self, i: u64) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i64(), i as _))
     }
 
     fn const_u128(&self, i: u128) -> Self::Value {
-        todo!()
+        // TODO: broken cast
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_i128(), i as _))
     }
 
     fn const_usize(&self, i: u64) -> Self::Value {
         // TODO: ptr size
-        let ty = self.type_isize();
-        let op = self.alloc_next_op();
-        op.mk_cnst_int(ty, i);
-        op
+        self.mk_next_op(|op| op.mk_cnst_int(self.type_isize(), i as _))
     }
 
     fn const_uint(&self, t: Self::Type, i: u64) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(t, i as _))
     }
 
     fn const_uint_big(&self, t: Self::Type, u: u128) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_int(t, u as _))
     }
 
+    // FIXME: more cast issues
+
     fn const_real(&self, t: Self::Type, val: f64) -> Self::Value {
-        todo!()
+        self.mk_next_op(|op| op.mk_cnst_float(t, val as _))
     }
 
     fn const_str(&self, s: &str) -> (Self::Value, Self::Value) {
@@ -666,8 +919,10 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         todo!()
     }
 
-    fn const_data_from_alloc(&self, alloc: interpret::ConstAllocation<'_>) -> Self::Value {
-        todo!()
+    fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
+        let var = self.alloc_bytes_var(&alloc);
+
+        self.mk_next_op(|op| op.mk_addr_glb(var))
     }
 
     fn scalar_to_backend(
@@ -731,7 +986,7 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
         trait_ref: Option<ty::ExistentialTraitRef<'tcx>>,
         vtable: Self::Value,
     ) {
-        todo!()
+        // TODO:
     }
 
     fn create_function_debug_context(
@@ -800,7 +1055,12 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
         align: rustc_abi::Align,
         kind: Option<&str>,
     ) -> Self::Value {
-        todo!()
+        // FIXME: we want this to deduplicate, ie search (using `cv`) if existing glb with this value exists
+
+        // we are in awkard scenario where `Value` is an `IrOp` but this is about static constants
+        // so we need to back it out into a value
+        // _however_, i think this is only called after `const_data_from_alloc` or similar, so we can return the op from that
+        cv
     }
 
     fn codegen_static(&self, def_id: DefId) {
@@ -813,6 +1073,22 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
 
     fn add_compiler_used_global(&self, global: Self::Value) {
         todo!()
+    }
+}
+
+impl From<Linkage> for IrLinkage {
+    fn from(value: Linkage) -> Self {
+        match value {
+            Linkage::External => IrLinkage::External,
+            Linkage::Internal => IrLinkage::Internal,
+            Linkage::AvailableExternally => todo!(),
+            Linkage::LinkOnceAny => todo!(),
+            Linkage::LinkOnceODR => todo!(),
+            Linkage::WeakAny => todo!(),
+            Linkage::WeakODR => todo!(),
+            Linkage::ExternalWeak => todo!(),
+            Linkage::Common => todo!(),
+        }
     }
 }
 
@@ -865,7 +1141,43 @@ impl<'tcx> CodegenCx<'tcx> {
         (fn_abi, params, ret)
     }
 
-    fn declare_fn(
+    pub fn declare_simple_fn(
+        &self,
+        defined: bool,
+        linkage: Linkage,
+        visibility: Visibility,
+        symbol_name: &str,
+        params: &[IrVarTy],
+        ret: &IrVarTy,
+    ) -> IrGlb {
+        // no `instance` param
+        if let Some(glb) = self.try_get_glb_by_name(symbol_name) {
+            return glb;
+        }
+
+        // FIXME: variadic flag for variadic fn
+        let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
+
+        // TODO: visibility
+        let glb = if defined {
+            let glb = self
+                .unit
+                .add_global_def_func(fun_ty, symbol_name, linkage.into());
+            self.build_fn_params(glb.func(), &params[..]);
+            glb
+        } else {
+            self.unit
+                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
+        };
+
+        self.glb_map
+            .borrow_mut()
+            .insert(symbol_name.to_string(), glb);
+
+        glb
+    }
+
+    pub fn declare_fn(
         &self,
         instance: Instance<'tcx>,
         linkage: Linkage,
@@ -874,29 +1186,56 @@ impl<'tcx> CodegenCx<'tcx> {
         params: &[IrVarTy],
         ret: &IrVarTy,
     ) -> IrGlb {
-        if let Some(glb) = self.fn_map.borrow().get(&instance).copied() {
+        if let Some(glb) = self.try_get_glb_by_name(symbol_name) {
             return glb;
         }
 
         // FIXME: variadic flag for variadic fn
         let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
 
+        // HACK: these arent working properly
+        let is_undef = symbol_name.contains("lang_internal");
+
         // TODO: visibility
-        if self.tcx.is_foreign_item(instance.def_id()) {
-            self.unit.add_global_undef_func(fun_ty, symbol_name)
+        let glb = if is_undef || self.tcx.is_foreign_item(instance.def_id()) {
+            self.unit
+                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
         } else {
-            self.unit.add_global_def_func(fun_ty, symbol_name)
+            let glb = self
+                .unit
+                .add_global_def_func(fun_ty, symbol_name, linkage.into());
+            self.build_fn_params(glb.func(), &params[..]);
+            glb
+        };
+
+        self.glb_map
+            .borrow_mut()
+            .insert(symbol_name.to_string(), glb);
+
+        glb
+    }
+
+    pub fn build_fn_params(&self, fun: IrFunc, params: &[IrVarTy]) -> IrBasicBlock {
+        // FIXME: recompute params in `declare_fn` and here
+        let bb = fun.alloc_basicblock();
+
+        if !params.is_empty() {
+            let param_stmt = fun.mk_param_stmt();
+
+            for &param in params {
+                if param.is_aggregate() {
+                    let lcl = fun.add_local(param);
+
+                    let op = param_stmt.alloc_op();
+                    op.mk_lcl_param(param);
+                } else {
+                    let op = param_stmt.alloc_op();
+                    op.mk_mov_param(param);
+                }
+            }
         }
-        // match linkage {
-        //     Linkage::External
-        //     | Linkage::AvailableExternally
-        //     | Linkage::LinkOnceAny
-        //     | Linkage::LinkOnceODR
-        //     | Linkage::WeakAny
-        //     | Linkage::WeakODR
-        //     | Linkage::ExternalWeak => unit.add_global_undef_func(fun_ty, symbol_name),
-        //     Linkage::Internal | Linkage::Common => unit.add_global_def_func(fun_ty, symbol_name),
-        // }
+
+        bb
     }
 }
 
@@ -919,7 +1258,8 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         symbol_name: &str,
     ) {
         let (_, params, ret) = self.abi_of(instance);
-        let glb = self.declare_fn(
+
+        self.declare_fn(
             instance,
             linkage,
             visibility,
@@ -927,49 +1267,22 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             &params[..],
             &ret,
         );
-        let fun = glb.func();
-
-        let unit = self.unit;
-
-        if glb.is_def() {
-            // FIXME: recompute params in `declare_fn` and here
-            let bb = fun.alloc_basicblock();
-
-            if !params.is_empty() {
-                let param_stmt = fun.mk_param_stmt();
-
-                for param in params {
-                    if param.is_aggregate() {
-                        let lcl = fun.add_local(param);
-
-                        let op = param_stmt.alloc_op();
-                        op.mk_lcl_param(param);
-                    } else {
-                        let op = param_stmt.alloc_op();
-                        op.mk_mov_param(param);
-                    }
-                }
-            }
-
-            *self.cur_bb.borrow_mut() = Some(bb);
-        }
-
-        self.fn_map.borrow_mut().insert(instance, glb);
     }
 }
 
 impl<'tcx> CodegenCx<'tcx> {
-    pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Self {
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, cg_unit: Option<&'tcx CodegenUnit<'tcx>>) -> Self {
         let arena = ArenaAlloc::new(b"codegen-cx");
         let unit = IrUnit::new(*arena.as_ref());
-        let fn_map = RefCell::new(FxHashMap::default());
+        let glb_map = RefCell::new(FxHashMap::default());
         let vtables = RefCell::new(FxHashMap::default());
 
         Self {
             tcx,
             arena,
+            cg_unit,
             unit,
-            fn_map,
+            glb_map,
             vtables,
             cur_bb: RefCell::new(None),
         }

@@ -20,6 +20,7 @@ extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
+extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_infer;
@@ -27,11 +28,13 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_stable_hash;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 extern crate rustc_ty_utils;
 extern crate rustc_type_ir;
 
+mod allocator;
 mod builder;
 mod driver;
 mod jcc;
@@ -50,6 +53,7 @@ use rustc_codegen_ssa::{
             TargetMachineFactoryFn,
         },
     },
+    base::maybe_create_entry_wrapper,
     mono_item::MonoItemExt,
     traits::{
         CodegenBackend, ExtraBackendMethods, ModuleBufferMethods, ThinBufferMethods,
@@ -177,7 +181,11 @@ impl ExtraBackendMethods for JccCodegenBackend {
         kind: AllocatorKind,
         alloc_error_handler_kind: AllocatorKind,
     ) -> Self::Module {
-        todo!()
+        let mut cx = CodegenCx::new(tcx, None);
+
+        allocator::codegen(&mut cx, module_name, kind, alloc_error_handler_kind);
+
+        cx.module()
     }
 
     fn compile_codegen_unit(
@@ -185,15 +193,18 @@ impl ExtraBackendMethods for JccCodegenBackend {
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
     ) -> (ModuleCodegen<Self::Module>, u64) {
-        let cx = CodegenCx::new(tcx);
-        let builder = Builder::with_cx(&cx);
-
         let cgu = tcx.codegen_unit(cgu_name);
+
+        let cx = CodegenCx::new(tcx, Some(cgu));
+        let builder = Builder::with_cx(&cx);
 
         for (item, data) in cgu.items() {
             item.predefine::<Builder<'_, '_>>(&builder, data.linkage, data.visibility);
             item.define::<Builder<'_, '_>>(&builder);
         }
+
+        // creates main fn if present
+        maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx);
 
         let module = builder.module();
 
