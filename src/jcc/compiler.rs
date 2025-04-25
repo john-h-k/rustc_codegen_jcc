@@ -1,5 +1,6 @@
 use std::{
     ffi::c_char,
+    intrinsics,
     marker::PhantomData,
     mem,
     path::Path,
@@ -64,6 +65,8 @@ where
 {
     ptr: *mut hashtbl,
     arena: ArenaAllocRef,
+
+    #[allow(clippy::type_complexity)]
     _phantom: PhantomData<(&'tbl (), Box<K>, Box<V>, KConv, VConv)>,
 }
 
@@ -142,9 +145,12 @@ where
     }
 
     pub fn into_raw(self) -> *mut hashtbl {
-        let p = self.ptr;
-        mem::forget(self);
-        p
+        // this has no drop atm, but when it does, you will need to `mem::forget`
+        debug_assert!(
+            !intrinsics::needs_drop::<Self>(),
+            "now has drop you will need to mem::forget",
+        );
+        self.ptr
     }
 }
 

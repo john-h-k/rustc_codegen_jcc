@@ -177,7 +177,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         match name {
             sym::black_box => {
                 // FIXME: jcc needs black box (probably via volatile)
-                return Ok(());
+                Ok(())
             }
             _ => todo!("intrinsic {name}"),
         }
@@ -1342,7 +1342,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
 
         let target = self.mk_op(llfn);
-        let args = args.into_iter().map(|&a| self.mk_op(a)).collect::<Vec<_>>();
+        let args = args.iter().map(|&a| self.mk_op(a)).collect::<Vec<_>>();
 
         let op = self.mk_next_op(|op| op.mk_call(llty, target, &args, ret));
         op.into()

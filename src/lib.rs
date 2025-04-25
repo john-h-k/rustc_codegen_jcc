@@ -3,9 +3,11 @@
 #![feature(f16, alloc_error_hook)]
 #![feature(allocator_api)]
 #![feature(ptr_as_ref_unchecked)]
+#![feature(core_intrinsics)]
 // #![warn(clippy::pedantic)]
 
 // TEMP: while impl
+#![allow(internal_features)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 

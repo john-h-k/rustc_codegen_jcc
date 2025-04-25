@@ -189,8 +189,7 @@ pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -
 
     assert!(
         !ty.has_escaping_bound_vars(),
-        "{:?} has escaping bound vars",
-        ty
+        "{ty:?} has escaping bound vars"
     );
 
     // Make sure lifetimes are erased, to avoid generating distinct LLVM
@@ -229,11 +228,9 @@ pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -
 
                 if let (&ty::Adt(def, _), &Variants::Single { index }) =
                     (ty.kind(), &layout.variants)
-                {
-                    if def.is_enum() && !def.variants().is_empty() {
+                    && def.is_enum() && !def.variants().is_empty() {
                         write!(&mut name, "::{}", def.variant(index).name).unwrap();
                     }
-                }
                 if let (&ty::Coroutine(_, _), &Variants::Single { index }) =
                     (ty.kind(), &layout.variants)
                 {
@@ -1253,7 +1250,7 @@ impl<'tcx> CodegenCx<'tcx> {
             let glb = self
                 .unit
                 .add_global_def_func(fun_ty, symbol_name, linkage.into());
-            self.build_fn_params(glb.func(), &params[..]);
+            self.build_fn_params(glb.func(), params);
             glb
         } else {
             self.unit
@@ -1288,7 +1285,7 @@ impl<'tcx> CodegenCx<'tcx> {
             let glb = self
                 .unit
                 .add_global_def_func(fun_ty, symbol_name, linkage.into());
-            self.build_fn_params(glb.func(), &params[..]);
+            self.build_fn_params(glb.func(), params);
             glb
         } else {
             self.unit
