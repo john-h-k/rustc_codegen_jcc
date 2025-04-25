@@ -3,4 +3,5 @@
 #include "compiler.h"
 #include "fs.h"
 #include "alloc.h"
+#include "hashtbl.h"
 #include "aarch64.h"

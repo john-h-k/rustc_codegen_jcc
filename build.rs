@@ -23,6 +23,7 @@ fn main() {
         .allowlist_file(".*/aarch64.h")
         .allowlist_file(".*/compiler.h")
         .allowlist_file(".*/fs.h")
+        .allowlist_file(".*/hashtbl.h")
         .allowlist_file(".*/ir/ir.h")
         .allowlist_file(".*/ir/prettyprint.h")
         .clang_arg("-I../jcc/src")

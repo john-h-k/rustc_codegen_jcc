@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    cmp::{self, Ordering},
     num::NonZeroUsize,
     ops::{Deref, Range},
 };
@@ -10,7 +11,7 @@ use rustc_codegen_ssa::{
     common::{IntPredicate, RealPredicate},
     mir::{
         operand::{OperandRef, OperandValue},
-        place::PlaceRef,
+        place::{PlaceRef, PlaceValue},
     },
     traits::{
         AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes,
@@ -21,6 +22,7 @@ use rustc_codegen_ssa::{
 };
 use rustc_middle::{
     bug,
+    middle::codegen_fn_attrs::CodegenFnAttrs,
     mir::coverage::CoverageKind,
     ty::{
         Instance, Ty, TyCtxt, TypingEnv,
@@ -38,62 +40,73 @@ use crate::{
     CodegenCx, JccModule,
     driver::{IrBuildValue, ty_to_jcc_ty},
     jcc::ir::{
-        AddrOffset, AsIrRaw, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrCnstTy, IrFunc,
-        IrId, IrOp, IrUnOpTy, IrVarTy,
+        AddrOffset, AsIrRaw, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrCnstTy, IrComment,
+        IrFunc, IrId, IrOp, IrUnOpTy, IrVarTy,
     },
 };
 
 pub struct Builder<'a, 'tcx> {
     cx: &'a CodegenCx<'tcx>,
     cur_bb: RefCell<Option<IrBasicBlock>>,
+    func: IrFunc,
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
-    pub fn with_cx(cx: &'a CodegenCx<'tcx>) -> Self {
+    pub fn with_cx(cx: &'a CodegenCx<'tcx>, cur_bb: IrBasicBlock) -> Self {
         Self {
             cx,
-            cur_bb: RefCell::new(None),
+            func: cur_bb.func(),
+            cur_bb: RefCell::new(Some(cur_bb)),
         }
+    }
+
+    fn get_block(&self) -> IrBasicBlock {
+        self.cur_bb.borrow_mut().unwrap()
+    }
+
+    fn end_block(&self) {
+        // *self.cur_bb.borrow_mut() = None;
     }
 
     pub fn module(&self) -> JccModule {
         self.cx.module()
     }
 
+    // marked 'mut' because 'mk_next_op' is _not_ and calling this within that closure will cause incorrect op orderings
+    pub fn mk_op(&mut self, value: IrBuildValue) -> IrOp {
+        match value {
+            IrBuildValue::Undf(var_ty) => self.mk_next_op(|op| op.mk_undf(var_ty)),
+            IrBuildValue::Poison(var_ty) => self.mk_next_op(|op| op.mk_undf(var_ty)),
+
+            IrBuildValue::Op(ir_op) => ir_op,
+            IrBuildValue::Cnst(ir_cnst) => self.mk_next_op(|op| op.mk_cnst(ir_cnst)),
+            IrBuildValue::GlbAddr { glb, offset } => {
+                let base = self.mk_next_op(|op| op.mk_addr_glb(glb));
+
+                match NonZeroUsize::new(offset) {
+                    None => base,
+                    Some(offset) => {
+                        self.mk_next_op(|op| op.mk_addr_offset(AddrOffset::offset(base, offset)))
+                    }
+                }
+            }
+        }
+    }
+
     pub fn alloc_next_op(&self) -> IrOp {
-        let bb = self.cur_bb.borrow().unwrap();
-        eprintln!("bb {}", bb.id());
-        eprintln!("bb {:?}", bb.as_mut_ptr());
-        eprintln!("{} stmts", bb.stmts().len());
+        let bb = self.get_block();
+
         let stmt = bb.alloc_stmt();
-        eprintln!(
-            "{} stmts new id {}",
-            bb.stmts().len(),
-            bb.last().unwrap().id()
-        );
+
         stmt.alloc_op()
     }
 
-    pub fn mk_next_op(&self, mk: impl FnOnce(IrOp)) -> IrOp {
+    pub fn mk_next_op(&self, mk: impl Fn(IrOp)) -> IrOp {
         let op = self.alloc_next_op();
 
         mk(op);
 
         op
-    }
-
-    fn set_cur_bb(&self, bb: IrBasicBlock) {
-        *self.cur_bb.borrow_mut() = Some(bb)
-    }
-
-    fn val_to_u64(&self, val: IrBuildValue) -> Option<u64> {
-        match val {
-            IrBuildValue::Cnst(ir_cnst) => match ir_cnst.cnst {
-                IrCnstTy::Int(val) => Some(val),
-                IrCnstTy::Float(_) => None,
-            },
-            IrBuildValue::Op(ir_op) => ir_op.get_int_cnst().map(|c| c.val),
-        }
     }
 }
 
@@ -223,28 +236,43 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         dst: PlaceRef<'tcx, Self::Value>,
     ) {
         // store argument passed to function, ie we are callee/receiver
-        let bb = self.cur_bb.borrow().unwrap();
-        let stmt = bb.alloc_stmt();
 
         let addr = dst.val.llval;
 
-        let value = match arg_abi.mode {
-            PassMode::Ignore => return,
-            PassMode::Direct(arg_attributes) => {
-                // need to get the nth argument
-                bb.func().get_param_op(*idx)
-            }
-            PassMode::Pair(arg_attributes, arg_attributes1) => todo!(),
-            PassMode::Cast { pad_i32, ref cast } => todo!(),
-            PassMode::Indirect {
-                attrs,
-                meta_attrs,
-                on_stack,
-            } => todo!(),
+        let mut next = || {
+            let val = self.get_param(*idx);
+            *idx += 1;
+            val
         };
 
-        let op = stmt.alloc_op();
-        op.mk_store_addr(addr.op(), value);
+        match arg_abi.mode {
+            PassMode::Ignore => {}
+            PassMode::Pair(..) => {
+                OperandValue::Pair(next(), next()).store(self, dst);
+            }
+            PassMode::Indirect {
+                attrs: _,
+                meta_attrs: Some(_),
+                on_stack: _,
+            } => {
+                let place_val = PlaceValue {
+                    llval: next(),
+                    llextra: Some(next()),
+                    align: arg_abi.layout.align.abi,
+                };
+                OperandValue::Ref(place_val).store(self, dst);
+            }
+            PassMode::Direct(_)
+            | PassMode::Indirect {
+                attrs: _,
+                meta_attrs: None,
+                on_stack: _,
+            }
+            | PassMode::Cast { .. } => {
+                let next_arg = next();
+                self.store_arg(arg_abi, next_arg, dst);
+            }
+        }
     }
 
     fn store_arg(
@@ -253,8 +281,63 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         val: Self::Value,
         dst: PlaceRef<'tcx, Self::Value>,
     ) {
-        // store argument to pass to function, ie we are caller/sender
-        // nop
+        match &arg_abi.mode {
+            PassMode::Ignore => {}
+            // Sized indirect arguments
+            PassMode::Indirect {
+                attrs,
+                meta_attrs: None,
+                on_stack: _,
+            } => {
+                let align = attrs.pointee_align.unwrap_or(arg_abi.layout.align.abi);
+                OperandValue::Ref(PlaceValue::new_sized(val, align)).store(self, dst);
+            }
+            // Unsized indirect qrguments
+            PassMode::Indirect {
+                attrs: _,
+                meta_attrs: Some(_),
+                on_stack: _,
+            } => {
+                bug!("unsized `ArgAbi` must be handled through `store_fn_arg`");
+            }
+            PassMode::Cast { cast, pad_i32: _ } => {
+                // The ABI mandates that the value is passed as a different struct representation.
+                // Spill and reload it from the stack to convert from the ABI representation to
+                // the Rust representation.
+                let scratch_size = cast.size(self);
+                let scratch_align = cast.align(self);
+                // Note that the ABI type may be either larger or smaller than the Rust type,
+                // due to the presence or absence of trailing padding. For example:
+                // - On some ABIs, the Rust layout { f64, f32, <f32 padding> } may omit padding
+                //   when passed by value, making it smaller.
+                // - On some ABIs, the Rust layout { u16, u16, u16 } may be padded up to 8 bytes
+                //   when passed by value, making it larger.
+                let copy_bytes = cmp::min(
+                    cast.unaligned_size(self).bytes(),
+                    arg_abi.layout.size.bytes(),
+                );
+                // Allocate some scratch space...
+                let llscratch = self.alloca(scratch_size, scratch_align);
+                self.lifetime_start(llscratch, scratch_size);
+                // ...store the value...
+                self.store(val, llscratch, scratch_align);
+                // ... and then memcpy it to the intended destination.
+                self.memcpy(
+                    dst.val.llval,
+                    arg_abi.layout.align.abi,
+                    llscratch,
+                    scratch_align,
+                    self.const_usize(copy_bytes),
+                    MemFlags::empty(),
+                );
+                self.lifetime_end(llscratch, scratch_size);
+            }
+            _ => {
+                OperandRef::from_immediate_or_packed_pair(self, val, arg_abi.layout)
+                    .val
+                    .store(self, dst);
+            }
+        }
     }
 
     fn arg_memory_ty(&self, arg_abi: &ArgAbi<'tcx, Ty<'tcx>>) -> Self::Type {
@@ -362,7 +445,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     type CodegenCx = CodegenCx<'tcx>;
 
     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self {
-        Builder::with_cx(cx)
+        Builder::with_cx(cx, llbb)
     }
 
     fn cx(&self) -> &Self::CodegenCx {
@@ -370,6 +453,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn llbb(&self) -> Self::BasicBlock {
+        // TODO: is clone proper
         self.cur_bb.borrow().unwrap()
     }
 
@@ -378,11 +462,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn append_block(cx: &'a Self::CodegenCx, llfn: Self::Function, name: &str) -> Self::BasicBlock {
-        // if only one bb, it is param block, keep using it
+        // if only one bb, it is param block,
         let first = llfn.first();
         if let Some(first) = first
-            && first.next().is_none()
+            && first.first().and_then(|b| b.next()).is_none()
         {
+            first.comment(name.as_bytes());
             return first;
         }
 
@@ -393,11 +478,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn append_sibling_block(&mut self, name: &str) -> Self::BasicBlock {
-        let cur = &self.cur_bb.borrow().unwrap();
-        let bb = cur.func().alloc_basicblock();
-
-        bb.comment(name.as_bytes());
-        bb
+        Self::append_block(self.cx, self.func, name)
     }
 
     fn switch_to_block(&mut self, llbb: Self::BasicBlock) {
@@ -405,24 +486,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn ret_void(&mut self) {
-        let op = self.alloc_next_op();
-        op.mk_ret(None);
-    }
-
-    fn ret(&mut self, v: Self::Value) {
-        let bb = self.cur_bb.borrow().unwrap();
+        let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Ret);
 
         let op = self.alloc_next_op();
-        op.mk_ret(Some(v.op()));
+        op.mk_ret(None);
+
+        self.end_block();
+    }
+
+    fn ret(&mut self, v: Self::Value) {
+        let bb = self.get_block();
+        bb.mk_ty(IrBasicBlockTy::Ret);
+
+        let op = self.alloc_next_op();
+        op.mk_ret(Some(self.mk_op(v)));
+
+        self.end_block();
     }
 
     fn br(&mut self, dest: Self::BasicBlock) {
-        let bb = self.cur_bb.borrow().unwrap();
+        let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Merge { target: dest });
 
         let op = self.alloc_next_op();
         op.mk_br();
+
+        self.end_block();
     }
 
     fn cond_br(
@@ -431,14 +521,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         then_llbb: Self::BasicBlock,
         else_llbb: Self::BasicBlock,
     ) {
-        let bb = self.cur_bb.borrow().unwrap();
+        let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Split {
             true_target: then_llbb,
             false_target: else_llbb,
         });
 
         let op = self.alloc_next_op();
-        op.mk_cond_br(cond.op());
+        op.mk_cond_br(self.mk_op(cond));
+
+        self.end_block();
     }
 
     fn switch(
@@ -453,7 +545,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn invoke(
         &mut self,
         llty: Self::Type,
-        fn_attrs: Option<&rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs>,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
@@ -466,134 +558,177 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn unreachable(&mut self) {
-        todo!()
+        // TODO: make JCC unreachable BB type
+        self.ret_void();
     }
 
     fn add(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Add, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Add, var_ty, lhs, rhs))
             .into()
     }
 
     fn fadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
             .into()
     }
 
     fn fadd_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
             .into()
     }
 
     fn fadd_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fadd, var_ty, lhs, rhs))
             .into()
     }
 
     fn sub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sub, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sub, var_ty, lhs, rhs))
             .into()
     }
 
     fn fsub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
             .into()
     }
 
     fn fsub_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
             .into()
     }
 
     fn fsub_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fsub, var_ty, lhs, rhs))
             .into()
     }
 
     fn mul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Mul, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Mul, var_ty, lhs, rhs))
             .into()
     }
 
     fn fmul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
             .into()
     }
 
     fn fmul_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
             .into()
     }
 
     fn fmul_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fmul, var_ty, lhs, rhs))
             .into()
     }
 
     fn udiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn exactudiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         // FIXME: what is this op?
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Udiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn sdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn exactsdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         // FIXME: what is this op?
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Sdiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn fdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn fdiv_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn fdiv_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Fdiv, var_ty, lhs, rhs))
             .into()
     }
 
     fn urem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Umod, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Umod, var_ty, lhs, rhs))
             .into()
     }
 
     fn srem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Smod, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Smod, var_ty, lhs, rhs))
             .into()
     }
 
@@ -611,55 +746,70 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn shl(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Lshift, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Lshift, var_ty, lhs, rhs))
             .into()
     }
 
     fn lshr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Urshift, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Urshift, var_ty, lhs, rhs))
             .into()
     }
 
     fn ashr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Srshift, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Srshift, var_ty, lhs, rhs))
             .into()
     }
 
     fn and(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::And, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::And, var_ty, lhs, rhs))
             .into()
     }
 
     fn or(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Or, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Or, var_ty, lhs, rhs))
             .into()
     }
 
     fn xor(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
         let var_ty = lhs.var_ty();
-        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Xor, var_ty, lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(IrBinOpTy::Xor, var_ty, lhs, rhs))
             .into()
     }
 
     fn neg(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Neg, var_ty, v.op()))
+        let v = self.mk_op(v);
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Neg, var_ty, v))
             .into()
     }
 
     fn fneg(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Fneg, var_ty, v.op()))
+        let v = self.mk_op(v);
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Fneg, var_ty, v))
             .into()
     }
 
     fn not(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Not, var_ty, v.op()))
+        let v = self.mk_op(v);
+        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Not, var_ty, v))
             .into()
     }
 
@@ -696,12 +846,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let sz = size.bytes_usize();
         let ty = self.unit.var_ty_bytes(sz);
 
-        let bb = self.cur_bb.borrow().unwrap();
+        let bb = self.get_block();
         let lcl = bb.func().add_local(ty);
 
         // TODO: should we alloc new stmt here?
         let op = self.alloc_next_op();
         op.mk_addr_lcl(lcl);
+        op.comment(b"alloca");
 
         op.into()
     }
@@ -711,7 +862,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: rustc_abi::Align) -> Self::Value {
-        self.mk_next_op(|op| op.mk_load_addr(ty, ptr.op())).into()
+        let ptr = self.mk_op(ptr);
+        self.mk_next_op(|op| op.mk_load_addr(ty, ptr)).into()
     }
 
     fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value {
@@ -759,27 +911,26 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             )
         } else if let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr {
             let b_offset = a.size(self).align_to(b.align(self).abi);
-            let load = |i: i32, scalar: &rustc_abi::Scalar, align: usize| {
+            let mut load = |i: i32, scalar: &rustc_abi::Scalar, align| {
                 let llptr = if i == 0 {
                     place.val.llval
                 } else {
                     self.inbounds_ptradd(place.val.llval, self.const_usize(b_offset.bytes()))
                 };
 
-                // let llty = place.layout.scalar_pair_element_gcc_type(self, i);
-                // let load = self.load(llty, llptr, align);
-                // scalar_load_metadata(self, load, scalar);
-                // if scalar.is_bool() {
-                //     self.trunc(load, self.type_i1())
-                // } else {
-                //     load
-                // }
+                let llty = ty_to_jcc_ty(self.cx, &place.layout);
+                let load = self.load(llty, llptr, align);
+
+                if scalar.is_bool() {
+                    self.trunc(load, self.type_i1())
+                } else {
+                    load
+                }
             };
-            // OperandValue::Pair(
-            //     load(0, a, place.val.align),
-            //     load(1, b, place.val.align.restrict_for_offset(b_offset))
-            // );
-            todo!("pairs")
+            OperandValue::Pair(
+                load(0, a, place.val.align),
+                load(1, b, place.val.align.restrict_for_offset(b_offset)),
+            )
         } else {
             OperandValue::Ref(place.val)
         };
@@ -800,11 +951,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn range_metadata(&mut self, load: Self::Value, range: rustc_abi::WrappingRange) {
-        todo!()
+        // nop
     }
 
     fn nonnull_metadata(&mut self, load: Self::Value) {
-        todo!()
+        // nop
     }
 
     fn store(
@@ -813,8 +964,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ptr: Self::Value,
         align: rustc_abi::Align,
     ) -> Self::Value {
-        self.mk_next_op(|op| op.mk_store_addr(ptr.op(), val.op()))
-            .into()
+        let ptr = self.mk_op(ptr);
+        let val = self.mk_op(val);
+
+        self.mk_next_op(|op| op.mk_store_addr(ptr, val)).into()
     }
 
     fn store_with_flags(
@@ -853,8 +1006,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let scale = self.unit.var_ty_info(ty).size;
         let scale = NonZeroUsize::new(scale).unwrap();
 
+        let base = self.mk_op(base);
+        let index = self.mk_op(index);
+
         let op = self.alloc_next_op();
-        op.mk_addr_offset(AddrOffset::index(base.op(), index.op(), scale));
+        op.mk_addr_offset(AddrOffset::index(base, index, scale));
         op.into()
     }
 
@@ -868,15 +1024,26 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_trunc(dest_ty, val.op())).into()
+        let src_ty = val.var_ty();
+        if dest_ty.is_i1() && src_ty.is_i8() {
+            // same size, but we need to generate an AND
+            // TODO: make jcc support `i1 = trunc i8`
+            let mask = self.mk_next_op(|op| op.mk_cnst_int(src_ty, 1));
+            return self.and(val, mask.into());
+        }
+
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_trunc(dest_ty, val)).into()
     }
 
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sext(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_sext(dest_ty, val)).into()
     }
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_zext(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_zext(dest_ty, val)).into()
     }
 
     fn fptoui_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -888,27 +1055,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn fptoui(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_uconv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_uconv(dest_ty, val)).into()
     }
 
     fn fptosi(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sconv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_sconv(dest_ty, val)).into()
     }
 
     fn uitofp(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_uconv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_uconv(dest_ty, val)).into()
     }
 
     fn sitofp(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_sconv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_sconv(dest_ty, val)).into()
     }
 
     fn fptrunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_conv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_conv(dest_ty, val)).into()
     }
 
     fn fpext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_conv(dest_ty, val.op())).into()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_conv(dest_ty, val)).into()
     }
 
     fn ptrtoint(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -927,15 +1100,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let src_ty = val.var_ty();
         debug_assert!(src_ty.is_int() && dest_ty.is_int());
 
-        match (dest_ty.is_int_larger(&src_ty), is_signed) {
-            (true, true) => self.sext(val, dest_ty),
-            (true, false) => self.zext(val, dest_ty),
-            (false, _) => self.trunc(val, dest_ty),
+        match (dest_ty.int_cmp(&src_ty), is_signed) {
+            (Ordering::Greater, true) => self.sext(val, dest_ty),
+            (Ordering::Greater, false) => self.zext(val, dest_ty),
+            (Ordering::Less, _) => self.trunc(val, dest_ty),
+            _ => val,
         }
     }
 
     fn pointercast(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        // nop
+        val
     }
 
     fn icmp(&mut self, op: IntPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
@@ -952,7 +1127,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             IntPredicate::IntSLE => IrBinOpTy::Slteq,
         };
 
-        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs, rhs))
             .into()
     }
 
@@ -977,7 +1154,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             RealPredicate::RealUNE => IrBinOpTy::Fneq,
         };
 
-        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs.op(), rhs.op()))
+        let lhs = self.mk_op(lhs);
+        let rhs = self.mk_op(rhs);
+        self.mk_next_op(|op| op.mk_binop(ty, self.type_i1(), lhs, rhs))
             .into()
     }
 
@@ -997,7 +1176,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let size = size.try_into().expect("u64 -> usize fail");
 
         let op = self.alloc_next_op();
-        op.mk_memcpy(src.op(), dst.op(), size);
+        op.mk_memcpy(self.mk_op(src), self.mk_op(dst), size);
     }
 
     fn memmove(
@@ -1029,7 +1208,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
 
         let op = self.alloc_next_op();
-        op.mk_memset(ptr.op(), fill_byte, size);
+        op.mk_memset(self.mk_op(ptr), fill_byte, size);
     }
 
     fn select(
@@ -1062,7 +1241,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_personality_fn(&mut self, personality: Self::Value) {
-        todo!()
+        // NOP
     }
 
     fn cleanup_landing_pad(&mut self, pers_fn: Self::Value) -> (Self::Value, Self::Value) {
@@ -1074,7 +1253,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn resume(&mut self, exn0: Self::Value, exn1: Self::Value) {
-        todo!()
+        self.unreachable();
     }
 
     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet {
@@ -1139,7 +1318,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn call(
         &mut self,
         llty: Self::Type,
-        fn_attrs: Option<&rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs>,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
@@ -1162,9 +1341,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
         };
 
-        let args = args.into_iter().map(|a| a.op()).collect::<Vec<_>>();
+        let target = self.mk_op(llfn);
+        let args = args.into_iter().map(|&a| self.mk_op(a)).collect::<Vec<_>>();
 
-        let op = self.mk_next_op(|op| op.mk_call(llty, llfn.op(), &args, ret));
+        let op = self.mk_next_op(|op| op.mk_call(llty, target, &args, ret));
         op.into()
     }
 

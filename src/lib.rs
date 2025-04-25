@@ -196,17 +196,16 @@ impl ExtraBackendMethods for JccCodegenBackend {
         let cgu = tcx.codegen_unit(cgu_name);
 
         let cx = CodegenCx::new(tcx, Some(cgu));
-        let builder = Builder::with_cx(&cx);
 
         for (item, data) in cgu.items() {
-            item.predefine::<Builder<'_, '_>>(&builder, data.linkage, data.visibility);
-            item.define::<Builder<'_, '_>>(&builder);
+            item.predefine::<Builder<'_, '_>>(&cx, data.linkage, data.visibility);
+            item.define::<Builder<'_, '_>>(&cx);
         }
 
         // creates main fn if present
         maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx);
 
-        let module = builder.module();
+        let module = cx.module();
 
         let cost = 100;
 

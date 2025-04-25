@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     ffi::{CString, c_char, c_int},
     fmt::{Debug, Formatter},
     io::{self, Stderr},
@@ -269,6 +270,10 @@ pub trait IrId {
     fn id(&self) -> usize;
 }
 
+pub trait IrComment {
+    fn comment(&self, comment: &[u8]);
+}
+
 pub trait FromIrRaw: AsIrRaw {
     fn from_raw(ptr: *mut Self::Raw) -> Self {
         Self::from_non_null(NonNull::new(ptr).unwrap())
@@ -283,9 +288,17 @@ pub trait FromIrRaw: AsIrRaw {
 
 macro_rules! ir_object_newtype {
     ($t:ident, $ty:ty, $obj:ident, $name:ident) => {
-        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[derive(Clone, Copy)]
         #[repr(transparent)]
         pub struct $t(NonNull<$ty>);
+
+        impl PartialEq for $t {
+            fn eq(&self, other: &Self) -> bool {
+                ptr::eq(self.as_mut_ptr(), other.as_mut_ptr())
+            }
+        }
+
+        impl Eq for $t {}
 
         impl AsIrRaw for $t {
             type Raw = $ty;
@@ -345,6 +358,24 @@ macro_rules! ir_object_id {
         }
     };
 }
+
+macro_rules! ir_object_comment {
+    ($t:ident) => {
+        impl IrComment for $t {
+            fn comment(&self, comment: &[u8]) {
+                let comment = self.func().arena().alloc_str(comment);
+
+                let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+                debug_assert!(p.comment.is_null(), "comment already set!");
+                p.comment = comment;
+            }
+        }
+    };
+}
+
+ir_object_comment!(IrBasicBlock);
+ir_object_comment!(IrStmt);
+ir_object_comment!(IrOp);
 
 ir_object_id!(IrGlb);
 ir_object_id!(IrLcl);
@@ -638,7 +669,16 @@ impl IrFunc {
             .expect("get_param_op but no bb present");
 
         debug_assert!(stmt.is_params(), "no params stmt!");
-        stmt.ops().nth(idx).expect("could not get param op")
+        let op = stmt.ops().nth(idx).expect("could not get param op");
+
+        unsafe {
+            debug_assert!(
+                ((*op.as_mut_ptr()).flags & IR_OP_FLAG_PARAM) != 0,
+                "expected param op"
+            );
+        }
+
+        op
     }
 
     pub fn alloc_basicblock(&self) -> IrBasicBlock {
@@ -692,13 +732,6 @@ impl IrBasicBlock {
                 ),
             }
         }
-    }
-
-    pub fn comment(&self, comment: &[u8]) {
-        let comment = self.func().arena().alloc_str(comment);
-
-        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
-        p.comment = comment;
     }
 
     pub fn func(&self) -> IrFunc {
@@ -848,6 +881,7 @@ pub enum IrCnstTy {
     Float(f64),
 }
 
+#[derive(Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum IrUnOpTy {
     Fneg = IR_OP_UNARY_OP_TY_FNEG,
@@ -858,6 +892,7 @@ pub enum IrUnOpTy {
     Not = IR_OP_UNARY_OP_TY_NOT,
 }
 
+#[derive(Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum IrBinOpTy {
     Eq = IR_OP_BINARY_OP_TY_EQ,
@@ -1014,6 +1049,13 @@ impl IrOp {
 
         p.ty = IR_OP_TY_UNDF;
         p.var_ty = var_ty;
+    }
+
+    pub fn mk_cnst(&self, IrCnst { var_ty, cnst }: IrCnst) {
+        match cnst {
+            IrCnstTy::Int(val) => self.mk_cnst_int(var_ty, val),
+            IrCnstTy::Float(val) => self.mk_cnst_float(var_ty, val),
+        }
     }
 
     pub fn mk_cnst_int(&self, IrVarTy(var_ty): IrVarTy, value: u64) {
@@ -1446,30 +1488,35 @@ impl IrVarTy {
         matches!(self.0.ty, IR_VAR_TY_TY_STRUCT | IR_VAR_TY_TY_UNION)
     }
 
-    pub fn is_int_larger(&self, other: &Self) -> bool {
+    pub fn int_cmp(&self, other: &Self) -> cmp::Ordering {
         debug_assert!(self.is_int() && other.is_int());
 
-        unsafe { self.0._1.primitive > other.0._1.primitive }
+        unsafe { self.0._1.primitive.cmp(&other.0._1.primitive) }
+    }
+
+    fn primitive(&self) -> u32 {
+        debug_assert_eq!(self.0.ty, IR_VAR_TY_TY_PRIMITIVE);
+        unsafe { self.0._1.primitive }
+    }
+
+    pub fn is_i1(&self) -> bool {
+        matches!(self.primitive(), IR_VAR_PRIMITIVE_TY_I1)
+    }
+
+    pub fn is_i8(&self) -> bool {
+        matches!(self.primitive(), IR_VAR_PRIMITIVE_TY_I8)
     }
 
     pub fn is_int(&self) -> bool {
-        unsafe {
-            matches!(
-                self.0,
-                ir_var_ty {
-                    ty: IR_VAR_TY_TY_PRIMITIVE,
-                    _1: ir_var_ty__bindgen_ty_1 {
-                        primitive: IR_VAR_PRIMITIVE_TY_I1
-                            | IR_VAR_PRIMITIVE_TY_I8
-                            | IR_VAR_PRIMITIVE_TY_I16
-                            | IR_VAR_PRIMITIVE_TY_I32
-                            | IR_VAR_PRIMITIVE_TY_I64
-                            | IR_VAR_PRIMITIVE_TY_I128
-                    },
-                    ..
-                }
-            )
-        }
+        matches!(
+            self.primitive(),
+            IR_VAR_PRIMITIVE_TY_I1
+                | IR_VAR_PRIMITIVE_TY_I8
+                | IR_VAR_PRIMITIVE_TY_I16
+                | IR_VAR_PRIMITIVE_TY_I32
+                | IR_VAR_PRIMITIVE_TY_I64
+                | IR_VAR_PRIMITIVE_TY_I128
+        )
     }
 
     pub fn is_fun(&self) -> bool {

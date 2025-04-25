@@ -28,15 +28,15 @@ use rustc_middle::{
 use rustc_session::Session;
 use rustc_span::{Symbol, def_id::DefId};
 use rustc_target::callconv::{ArgAbi, CastTarget, FnAbi, PassMode};
-use rustc_type_ir::{FloatTy, IntTy, TypeVisitableExt, UintTy};
+use rustc_type_ir::TypeVisitableExt;
 use smallvec::{SmallVec, smallvec};
 
 use crate::jcc::{
     alloc::ArenaAlloc,
     ir::{
-        AddrOffset, AsIrRaw, IrBasicBlock, IrCnst, IrFloatTy, IrFunc, IrGlb, IrId, IrIntTy,
-        IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags,
-        IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
+        AddrOffset, AsIrRaw, IrBasicBlock, IrCnst, IrCnstTy, IrFloatTy, IrFunc, IrGlb, IrId,
+        IrIntTy, IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy,
+        IrVarTyFuncFlags, IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
     },
 };
 
@@ -75,6 +75,38 @@ pub fn float_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, float: rustc_abi::Float) -
         Float::F64 => cx.type_f64(),
         Float::F128 => cx.type_f128(),
     }
+}
+
+fn scalar_pair_element_to_jcc_ty<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    layout: &TyAndLayout<'tcx>,
+    index: usize,
+    immediate: bool,
+) -> IrVarTy {
+    // This must produce the same result for `repr(transparent)` wrappers as for the inner type!
+    // In other words, this should generally not look at the type at all, but only at the
+    // layout.
+    let BackendRepr::ScalarPair(a, b) = layout.backend_repr else {
+        bug!(
+            "TyAndLayout::scalar_pair_element_llty({:?}): not applicable",
+            layout
+        );
+    };
+
+    let scalar = [a, b][index];
+
+    // Make sure to return the same type `immediate_llvm_type` would when
+    // dealing with an immediate pair. This means that `(bool, bool)` is
+    // effectively represented as `{i8, i8}` in memory and two `i1`s as an
+    // immediate, just like `bool` is typically `i8` in memory and only `i1`
+    // when immediate. We need to load/store `bool` as `i8` to avoid
+    // crippling LLVM optimizations or triggering other LLVM bugs with `i1`.
+
+    if immediate && scalar.is_bool() {
+        return cx.type_i1();
+    }
+
+    scalar_ty_to_jcc_ty(cx, &scalar)
 }
 
 pub fn scalar_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, scalar: &rustc_abi::Scalar) -> IrVarTy {
@@ -388,7 +420,7 @@ impl<'tcx> CodegenCx<'tcx> {
 
             let address_space = self.tcx.global_alloc(prov.alloc_id()).address_space(self);
 
-            self.scalar_to_var_value(
+            let value = self.scalar_to_var_value(
                 interpret::Scalar::from_pointer(
                     Pointer::new(prov, rustc_abi::Size::from_bytes(ptr_offset)),
                     &self.tcx,
@@ -399,6 +431,8 @@ impl<'tcx> CodegenCx<'tcx> {
                 },
                 self.type_ptr_ext(address_space),
             );
+
+            llvals.push(IrVarValueListEl { value, offset });
 
             next_offset = offset + pointer_size;
         }
@@ -441,14 +475,26 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
 // so we need a flexible way to represent them
 #[derive(Debug, Clone, Copy)]
 pub enum IrBuildValue {
+    Undf(IrVarTy),
+    Poison(IrVarTy),
     Cnst(IrCnst),
     Op(IrOp),
-    GlbAddr(IrGlb),
+    GlbAddr { glb: IrGlb, offset: usize },
 }
 
 impl From<IrOp> for IrBuildValue {
     fn from(value: IrOp) -> Self {
         Self::Op(value)
+    }
+}
+
+impl IrBuildValue {
+    pub fn glb_addr(glb: IrGlb) -> Self {
+        Self::GlbAddr { glb, offset: 0 }
+    }
+
+    pub fn glb_addr_with_offset(glb: IrGlb, offset: usize) -> Self {
+        Self::GlbAddr { glb, offset }
     }
 }
 
@@ -466,6 +512,8 @@ impl IrBuildValue {
         match self {
             IrBuildValue::Cnst(IrCnst { var_ty, .. }) => *var_ty,
             IrBuildValue::Op(ir_op) => ir_op.var_ty(),
+            IrBuildValue::GlbAddr { .. } => IrVarTy::ty_pointer(),
+            IrBuildValue::Undf(var_ty) | IrBuildValue::Poison(var_ty) => *var_ty,
         }
     }
 }
@@ -527,6 +575,17 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
 }
 
 impl CodegenCx<'_> {
+    pub fn val_to_u64(&self, val: IrBuildValue) -> Option<u64> {
+        match val {
+            IrBuildValue::Cnst(ir_cnst) => match ir_cnst.cnst {
+                IrCnstTy::Int(val) => Some(val),
+                IrCnstTy::Float(_) => None,
+            },
+            IrBuildValue::Op(ir_op) => ir_op.get_int_cnst().map(|c| c.val),
+            _ => None,
+        }
+    }
+
     pub fn type_none(&self) -> IrVarTy {
         IrVarTy::ty_none()
     }
@@ -663,13 +722,12 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
         let glb = self.get_glb(instance);
 
-        let op = self.alloc_next_op();
-        op.mk_addr_glb(glb);
-        op
+        IrBuildValue::glb_addr(glb)
     }
 
     fn eh_personality(&self) -> Self::Value {
-        todo!()
+        // just need a dummy
+        IrBuildValue::Undf(IrVarTy::ty_none())
     }
 
     fn sess(&self) -> &Session {
@@ -705,11 +763,7 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
 
         // NOTE: it is needed to set the current_func here as well, because get_fn() is not called
         // for the main function.
-
-        // FIXME: have cur_fun + cur_bb not just bb (or something)
-        let bb = func.func().last().unwrap();
-
-        self.set_cur_bb(bb);
+        // TODO ABOVE
 
         Some(func.func())
     }
@@ -767,7 +821,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         index: usize,
         immediate: bool,
     ) -> Self::Type {
-        todo!()
+        scalar_pair_element_to_jcc_ty(self, &layout, index, immediate)
     }
 }
 
@@ -838,70 +892,109 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_undef(&self, t: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_undf(t))
+        IrBuildValue::Undf(t)
     }
 
     fn const_poison(&self, t: Self::Type) -> Self::Value {
-        self.mk_next_op(|op| op.mk_undf(t))
+        IrBuildValue::Poison(t)
     }
 
     fn const_bool(&self, val: bool) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i1(), if val { 1 } else { 0 }))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i1(),
+            cnst: IrCnstTy::Int(if val { 1 } else { 0 }),
+        })
     }
 
     // TODO: check cast logic for all these
 
     fn const_i8(&self, i: i8) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i8(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i8(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_i16(&self, i: i16) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i16(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i16(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_i32(&self, i: i32) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i32(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i32(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_int(&self, t: Self::Type, i: i64) -> Self::Value {
         // what does int mean here?
-        self.mk_next_op(|op| op.mk_cnst_int(t, i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: t,
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_u8(&self, i: u8) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i8(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i8(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_u32(&self, i: u32) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i32(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i32(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_u64(&self, i: u64) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i64(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i64(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_u128(&self, i: u128) -> Self::Value {
         // TODO: broken cast
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_i128(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_i128(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_usize(&self, i: u64) -> Self::Value {
         // TODO: ptr size
-        self.mk_next_op(|op| op.mk_cnst_int(self.type_isize(), i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_isize(),
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_uint(&self, t: Self::Type, i: u64) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(t, i as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: t,
+            cnst: IrCnstTy::Int(i as _),
+        })
     }
 
     fn const_uint_big(&self, t: Self::Type, u: u128) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_int(t, u as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: t,
+            cnst: IrCnstTy::Int(u as _),
+        })
     }
 
     // FIXME: more cast issues
 
     fn const_real(&self, t: Self::Type, val: f64) -> Self::Value {
-        self.mk_next_op(|op| op.mk_cnst_float(t, val as _))
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: t,
+            cnst: IrCnstTy::Float(val as _),
+        })
     }
 
     fn const_str(&self, s: &str) -> (Self::Value, Self::Value) {
@@ -917,17 +1010,17 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_to_opt_uint(&self, v: Self::Value) -> Option<u64> {
-        todo!()
+        Some(self.val_to_u64(v)? as _)
     }
 
     fn const_to_opt_u128(&self, v: Self::Value, sign_ext: bool) -> Option<u128> {
-        todo!()
+        Some(self.val_to_u64(v)? as _)
     }
 
     fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
         let var = self.alloc_bytes_var(&alloc);
 
-        self.mk_next_op(|op| op.mk_addr_glb(var))
+        IrBuildValue::glb_addr(var)
     }
 
     fn scalar_to_backend(
@@ -941,9 +1034,7 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                 // TODO: handle properly
                 let value = scalar_int.to_bits_unchecked() as u64;
 
-                let op = self.alloc_next_op();
-                op.mk_cnst_int(llty, value);
-                op
+                self.const_u64(value)
             }
             interpret::Scalar::Ptr(ptr, _size) => {
                 let (prov, offset) = ptr.into_parts();
@@ -952,18 +1043,14 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                     GlobalAlloc::Function { instance } => {
                         let glb = self.get_glb(instance);
 
-                        let op = self.alloc_next_op();
-                        op.mk_addr_glb(glb);
-                        op
+                        IrBuildValue::glb_addr(glb)
                     }
                     GlobalAlloc::VTable(ty, raw_list) => todo!(),
                     GlobalAlloc::Static(def_id) => todo!(),
                     GlobalAlloc::Memory(const_allocation) => {
                         let glb = self.alloc_bytes_var(&const_allocation);
 
-                        let op = self.alloc_next_op();
-                        op.mk_addr_glb(glb);
-                        op
+                        IrBuildValue::glb_addr(glb)
                     }
                 }
             }
@@ -971,16 +1058,15 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn const_ptr_byte_offset(&self, val: Self::Value, offset: rustc_abi::Size) -> Self::Value {
-        let Some(offset) = NonZeroUsize::new(offset.bytes_usize()) else {
+        let Some(base) = NonZeroUsize::new(offset.bytes_usize()) else {
             return val;
         };
 
-        let offset = AddrOffset::offset(val, offset);
+        let IrBuildValue::GlbAddr { glb, offset } = val else {
+            panic!("non glb-addr");
+        };
 
-        let op = val.stmt().alloc_op();
-        op.mk_addr_offset(offset);
-
-        op
+        IrBuildValue::glb_addr_with_offset(glb, base.get() + offset)
     }
 }
 
@@ -1122,7 +1208,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 attrs,
                 meta_attrs,
                 on_stack,
-            } => todo!(),
+            } => smallvec![self.type_ptr()],
         }
     }
 
@@ -1198,19 +1284,16 @@ impl<'tcx> CodegenCx<'tcx> {
         // FIXME: variadic flag for variadic fn
         let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
 
-        // HACK: these arent working properly
-        let is_undef = symbol_name.contains("lang_internal");
-
         // TODO: visibility
-        let glb = if is_undef || self.tcx.is_foreign_item(instance.def_id()) {
-            self.unit
-                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
-        } else {
+        let glb = if self.tcx.is_codegened_item(instance.def_id()) {
             let glb = self
                 .unit
                 .add_global_def_func(fun_ty, symbol_name, linkage.into());
             self.build_fn_params(glb.func(), &params[..]);
             glb
+        } else {
+            self.unit
+                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
         };
 
         self.glb_map
