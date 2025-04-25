@@ -531,6 +531,7 @@ pub fn mk_value(
         ty,
         var_ty: IrVarTy(var_ty),
     }: &IrVarValue,
+    base: usize,
 ) -> ir_var_value {
     let arena = unit.mk_arena();
 
@@ -566,10 +567,11 @@ pub fn mk_value(
             let offsets = arena.alloc_slice::<usize>(num_values);
             for (i, IrVarValueListEl { offset, value }) in ir_var_values.iter().enumerate() {
                 unsafe {
-                    let value = mk_value(unit, value);
+                    let offset = base + offset;
+                    let value = mk_value(unit, value, offset);
 
                     values.add(i).write(value);
-                    offsets.add(i).write(*offset)
+                    offsets.add(i).write(offset)
                 }
             }
 
@@ -610,7 +612,7 @@ impl IrVar {
         let arena = unit.mk_arena();
 
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
-        p.value = mk_value(unit, value);
+        p.value = mk_value(unit, value, 0);
     }
 }
 
@@ -699,7 +701,7 @@ impl IrFunc {
     }
 }
 
-pub enum IrBasicBlockTy {
+pub enum IrBasicBlockTy<'a> {
     Ret,
     Merge {
         target: IrBasicBlock,
@@ -708,11 +710,17 @@ pub enum IrBasicBlockTy {
         true_target: IrBasicBlock,
         false_target: IrBasicBlock,
     },
+    Switch {
+        default_target: IrBasicBlock,
+        cases: &'a [(u128, IrBasicBlock)],
+    },
 }
 
 impl IrBasicBlock {
     pub fn mk_ty(&self, ty: IrBasicBlockTy) {
-        let f = self.func().as_mut_ptr();
+        let func = self.func();
+        let arena = func.unit().mk_arena();
+        let f = func.as_mut_ptr();
         let p = self.as_mut_ptr();
 
         unsafe {
@@ -730,6 +738,27 @@ impl IrBasicBlock {
                     true_target.as_mut_ptr(),
                     false_target.as_mut_ptr(),
                 ),
+                IrBasicBlockTy::Switch {
+                    default_target,
+                    cases,
+                } => {
+                    let split_cases = arena.alloc_slice::<ir_split_case>(cases.len());
+
+                    for (i, &(value, target)) in cases.iter().enumerate() {
+                        split_cases.add(i).write(ir_split_case {
+                            value: value.try_into().expect("u128"),
+                            target: target.as_mut_ptr(),
+                        })
+                    }
+
+                    ir_make_basicblock_switch(
+                        f,
+                        p,
+                        cases.len(),
+                        split_cases,
+                        default_target.as_mut_ptr(),
+                    )
+                }
             }
         }
     }
@@ -839,7 +868,7 @@ impl AddrOffset {
         Self {
             base,
             index: Some(index),
-            scale: 0,
+            scale: scale.get(),
             offset: None,
         }
     }
@@ -992,7 +1021,7 @@ impl IrOp {
         }
     }
 
-    pub fn mk_cond_br(&self, cond: IrOp) {
+    pub fn mk_br_cond(&self, cond: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         unsafe {
@@ -1000,6 +1029,18 @@ impl IrOp {
             p.var_ty = IR_VAR_TY_NONE;
             p._1.br_cond = ir_op_br_cond {
                 cond: cond.as_mut_ptr(),
+            };
+        }
+    }
+
+    pub fn mk_br_switch(&self, value: IrOp) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        unsafe {
+            p.ty = IR_OP_TY_BR_SWITCH;
+            p.var_ty = IR_VAR_TY_NONE;
+            p._1.br_switch = ir_op_br_switch {
+                value: value.as_mut_ptr(),
             };
         }
     }
@@ -1041,6 +1082,16 @@ impl IrOp {
         p.flags |= IR_OP_FLAG_PARAM;
         p._1.mov = ir_op_mov {
             value: ptr::null_mut(),
+        };
+    }
+
+    pub fn mk_mov(&self, IrVarTy(var_ty): IrVarTy, op: IrOp) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_MOV;
+        p.var_ty = var_ty;
+        p._1.mov = ir_op_mov {
+            value: op.as_mut_ptr(),
         };
     }
 

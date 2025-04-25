@@ -17,7 +17,7 @@ use rustc_middle::{
     bug,
     mir::mono::{CodegenUnit, Linkage, Visibility},
     ty::{
-        self, CoroutineArgsExt, ExistentialTraitRef, Instance, Ty, TyCtxt, TyKind, TypingEnv,
+        self, CoroutineArgsExt, ExistentialTraitRef, Instance, Ty, TyCtxt, TypingEnv,
         layout::{
             FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers,
             TyAndLayout,
@@ -34,8 +34,9 @@ use smallvec::{SmallVec, smallvec};
 use crate::jcc::{
     alloc::ArenaAlloc,
     ir::{
-        IrBasicBlock, IrCnst, IrCnstTy, IrFunc, IrGlb, IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy,
-        IrVarTyFuncFlags, IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
+        IrBasicBlock, IrCnst, IrCnstTy, IrFunc, IrGlb, IrLinkage, IrOp, IrUnit, IrVarTy,
+        IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags, IrVarValue, IrVarValueAddr,
+        IrVarValueListEl, IrVarValueTy,
     },
 };
 
@@ -76,7 +77,7 @@ pub fn float_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, float: rustc_abi::Float) -
     }
 }
 
-fn scalar_pair_element_to_jcc_ty<'tcx>(
+pub fn scalar_pair_element_to_jcc_ty<'tcx>(
     cx: &CodegenCx<'tcx>,
     layout: &TyAndLayout<'tcx>,
     index: usize,
@@ -170,6 +171,33 @@ fn struct_fields<'tcx>(cx: &CodegenCx<'tcx>, layout: &TyAndLayout<'tcx>) -> (Vec
     (result, packed)
 }
 
+pub fn ty_to_jcc_immediate_ty<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    ty_layout: &TyAndLayout<'tcx>,
+) -> IrVarTy {
+    match ty_layout.backend_repr {
+        BackendRepr::Scalar(scalar) => {
+            if scalar.is_bool() {
+                return cx.type_i1();
+            }
+        }
+        BackendRepr::ScalarPair(..) => {
+            // An immediate pair always contains just the two elements, without any padding
+            // filler, as it should never be stored to memory.
+            return cx.type_struct(
+                &[
+                    scalar_pair_element_to_jcc_ty(cx, ty_layout, 0, true),
+                    scalar_pair_element_to_jcc_ty(cx, ty_layout, 1, true),
+                ],
+                false,
+            );
+        }
+        _ => {}
+    };
+
+    ty_to_jcc_ty(cx, ty_layout)
+}
+
 pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -> IrVarTy {
     let TyAndLayout { ty, layout } = &ty_layout;
 
@@ -228,9 +256,11 @@ pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -
 
                 if let (&ty::Adt(def, _), &Variants::Single { index }) =
                     (ty.kind(), &layout.variants)
-                    && def.is_enum() && !def.variants().is_empty() {
-                        write!(&mut name, "::{}", def.variant(index).name).unwrap();
-                    }
+                    && def.is_enum()
+                    && !def.variants().is_empty()
+                {
+                    write!(&mut name, "::{}", def.variant(index).name).unwrap();
+                }
                 if let (&ty::Coroutine(_, _), &Variants::Single { index }) =
                     (ty.kind(), &layout.variants)
                 {
@@ -350,17 +380,26 @@ impl<'tcx> CodegenCx<'tcx> {
             let chunk_to_llval = move |chunk| match chunk {
                 InitChunk::Init(range) => {
                     let range = (range.start.bytes() as usize)..(range.end.bytes() as usize);
-                    let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
+                    let bytes =
+                        alloc.inspect_with_uninit_and_ptr_outside_interpreter(range.clone());
 
                     Some(IrVarValueListEl {
-                        offset,
-                        value: IrVarValue::from_bytes(cx.unit, offset, bytes),
+                        offset: range.start,
+                        value: IrVarValue::from_bytes(cx.unit, 0, bytes),
                     })
                 }
                 InitChunk::Uninit(range) => {
+                    let range = (range.start.bytes() as usize)..(range.end.bytes() as usize);
+                    let bytes =
+                        alloc.inspect_with_uninit_and_ptr_outside_interpreter(range.clone());
+
+                    Some(IrVarValueListEl {
+                        offset: range.start,
+                        value: IrVarValue::from_bytes(cx.unit, 0, bytes),
+                    })
                     // do nothing, all ranges outside of value lists are uninit
                     // (or they are zeroed currently i think? but they are _meant_ be uninit)
-                    None
+                    // None
                 }
             };
 
@@ -381,7 +420,7 @@ impl<'tcx> CodegenCx<'tcx> {
 
                 llvals.push(IrVarValueListEl {
                     offset,
-                    value: IrVarValue::from_bytes(cx.unit, offset, bytes),
+                    value: IrVarValue::from_bytes(cx.unit, 0, bytes),
                 });
             }
         }
@@ -391,6 +430,7 @@ impl<'tcx> CodegenCx<'tcx> {
             let offset = offset.bytes();
             assert_eq!(offset as usize as u64, offset);
             let offset = offset as usize;
+
             if offset > next_offset {
                 // This `inspect` is okay since we have checked that there is no provenance, it
                 // is within the bounds of the allocation, and it doesn't affect interpreter execution
@@ -402,6 +442,7 @@ impl<'tcx> CodegenCx<'tcx> {
                     next_offset..offset,
                 );
             }
+
             let ptr_offset = read_target_uint(
                 dl.endian,
                 // This `inspect` is okay since it is within the bounds of the allocation, it doesn't
@@ -789,26 +830,18 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type {
-        ty_to_jcc_ty(self, &layout)
+        ty_to_jcc_immediate_ty(self, &layout)
     }
 
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool {
         matches!(
-            layout.ty.kind(),
-            TyKind::Bool
-                | TyKind::Char
-                | TyKind::Int(..)
-                | TyKind::Uint(..)
-                | TyKind::Float(..)
-                | TyKind::RawPtr(..)
-                | TyKind::FnPtr(..)
-                | TyKind::Ref(..)
+            layout.backend_repr,
+            BackendRepr::Scalar(..) | BackendRepr::SimdVector { .. }
         )
     }
 
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool {
-        let kind = layout.ty.kind();
-        matches!(kind, TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) if self.tcx.type_has_metadata(*pointee_ty, TypingEnv::fully_monomorphized()))
+        matches!(layout.backend_repr, BackendRepr::ScalarPair(..))
     }
 
     fn scalar_pair_element_backend_type(
@@ -884,7 +917,10 @@ impl<'tcx> CodegenCx<'tcx> {
 
 impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
     fn const_null(&self, t: Self::Type) -> Self::Value {
-        todo!()
+        IrBuildValue::Cnst(IrCnst {
+            var_ty: self.type_ptr(),
+            cnst: IrCnstTy::Int(0),
+        })
     }
 
     fn const_undef(&self, t: Self::Type) -> Self::Value {
@@ -1202,6 +1238,19 @@ impl<'tcx> CodegenCx<'tcx> {
             PassMode::Cast { pad_i32, cast } => todo!(),
             PassMode::Indirect {
                 attrs,
+                meta_attrs: Some(..),
+                on_stack,
+            } => {
+                let ptr_ty = Ty::new_mut_ptr(self.tcx, arg.layout.ty);
+                let ptr_layout = self.layout_of(ptr_ty);
+
+                smallvec![
+                    scalar_pair_element_to_jcc_ty(self, &ptr_layout, 0, true),
+                    scalar_pair_element_to_jcc_ty(self, &ptr_layout, 1, true),
+                ]
+            }
+            PassMode::Indirect {
+                attrs,
                 meta_attrs,
                 on_stack,
             } => smallvec![self.type_ptr()],
@@ -1212,17 +1261,31 @@ impl<'tcx> CodegenCx<'tcx> {
         let params = &fn_abi.args;
         let ret = &fn_abi.ret;
 
-        let params = params
+        let mut params = params
             .iter()
             .flat_map(|arg| self.abi_map_ty(arg))
             .collect::<Vec<_>>();
 
-        let ret = self.backend_type(ret.layout);
+        match ret.mode {
+            PassMode::Indirect { .. } => {
+                let ret_ptr = self.type_ptr();
+                params.insert(0, ret_ptr);
 
-        (params, ret)
+                (params, IrVarTy::ty_none())
+            }
+            _ => {
+                // FIXME: does not support multi-el returns (bad!)
+                let ret = self.backend_type(ret.layout);
+
+                (params, ret)
+            }
+        }
     }
 
-    fn abi_of(&self, instance: Instance<'tcx>) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy>, IrVarTy) {
+    pub fn abi_of(
+        &self,
+        instance: Instance<'tcx>,
+    ) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy>, IrVarTy) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (params, ret) = self.abi_fn_ty(fn_abi);
         (fn_abi, params, ret)

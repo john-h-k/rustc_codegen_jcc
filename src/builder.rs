@@ -5,7 +5,7 @@ use std::{
     ops::{Deref, Range},
 };
 
-use rustc_abi::{BackendRepr, HasDataLayout, TargetDataLayout};
+use rustc_abi::{HasDataLayout, TargetDataLayout};
 use rustc_codegen_ssa::{
     MemFlags,
     common::{IntPredicate, RealPredicate},
@@ -17,7 +17,7 @@ use rustc_codegen_ssa::{
         AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes,
         BaseTypeCodegenMethods, BuilderMethods, ConstCodegenMethods, CoverageInfoBuilderMethods,
         DebugInfoBuilderMethods, IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods,
-        StaticBuilderMethods,
+        MiscCodegenMethods, StaticBuilderMethods,
     },
 };
 use rustc_middle::{
@@ -25,23 +25,24 @@ use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrs,
     mir::coverage::CoverageKind,
     ty::{
-        Instance, Ty, TyCtxt, TypingEnv,
+        Instance, Ty, TyCtxt, TyKind, TypingEnv,
         layout::{
             FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTyCtxt, HasTypingEnv, LayoutError,
             LayoutOf, LayoutOfHelpers, MaybeResult, TyAndLayout,
         },
     },
 };
+use rustc_session::config::OptLevel;
 use rustc_span::sym;
 use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 use rustc_type_ir::TyKind::FnDef;
 
 use crate::{
     CodegenCx, JccModule,
-    driver::{IrBuildValue, ty_to_jcc_ty},
+    driver::{IrBuildValue, scalar_pair_element_to_jcc_ty, ty_to_jcc_ty},
     jcc::ir::{
-        AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrComment,
-        IrFunc, IrOp, IrUnOpTy, IrVarTy,
+        AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrComment, IrFunc, IrOp,
+        IrUnOpTy, IrVarTy,
     },
 };
 
@@ -489,30 +490,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Ret);
 
-        let op = self.alloc_next_op();
-        op.mk_ret(None);
-
-        self.end_block();
+        self.mk_next_op(|op| op.mk_ret(None));
     }
 
     fn ret(&mut self, v: Self::Value) {
         let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Ret);
 
-        let op = self.alloc_next_op();
-        op.mk_ret(Some(self.mk_op(v)));
-
-        self.end_block();
+        let v = self.mk_op(v);
+        self.mk_next_op(|op| op.mk_ret(Some(v)));
     }
 
     fn br(&mut self, dest: Self::BasicBlock) {
         let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Merge { target: dest });
 
-        let op = self.alloc_next_op();
-        op.mk_br();
-
-        self.end_block();
+        self.mk_next_op(|op| op.mk_br());
     }
 
     fn cond_br(
@@ -527,10 +520,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             false_target: else_llbb,
         });
 
-        let op = self.alloc_next_op();
-        op.mk_cond_br(self.mk_op(cond));
-
-        self.end_block();
+        let cond = self.mk_op(cond);
+        let op = self.mk_next_op(|op| op.mk_br_cond(cond));
     }
 
     fn switch(
@@ -539,7 +530,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         else_llbb: Self::BasicBlock,
         cases: impl ExactSizeIterator<Item = (u128, Self::BasicBlock)>,
     ) {
-        todo!()
+        let bb = self.get_block();
+        bb.mk_ty(IrBasicBlockTy::Switch {
+            default_target: else_llbb,
+            cases: &cases.collect::<Vec<_>>(),
+        });
+
+        let v = self.mk_op(v);
+        let op = self.mk_next_op(|op| op.mk_br_switch(v));
     }
 
     fn invoke(
@@ -850,9 +848,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let lcl = bb.func().add_local(ty);
 
         // TODO: should we alloc new stmt here?
-        let op = self.alloc_next_op();
-        op.mk_addr_lcl(lcl);
-        op.comment(b"alloca");
+        let op = self.mk_next_op(|op| op.mk_addr_lcl(lcl));
 
         op.into()
     }
@@ -884,52 +880,115 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         &mut self,
         place: PlaceRef<'tcx, Self::Value>,
     ) -> OperandRef<'tcx, Self::Value> {
+        if place.layout.is_unsized() {
+            let tail = self
+                .tcx
+                .struct_tail_for_codegen(place.layout.ty, self.typing_env());
+            if matches!(tail.kind(), TyKind::Foreign(..)) {
+                // Unsized locals and, at least conceptually, even unsized arguments must be copied
+                // around, which requires dynamically determining their size. Therefore, we cannot
+                // allow `extern` types here. Consult t-opsem before removing this check.
+                panic!("unsized locals must not be `extern` types");
+            }
+        }
+        assert_eq!(place.val.llextra.is_some(), place.layout.is_unsized());
         if place.layout.is_zst() {
-            todo!("load zst");
+            return OperandRef::zero_sized(place.layout);
         }
 
-        // let op = self.alloc_next_op();
-        // op.mk_store_addr(ptr, val);
-        // op
+        fn scalar_load_metadata<'a, 'll, 'tcx>(
+            bx: &mut Builder<'a, 'tcx>,
+            load: IrBuildValue,
+            scalar: rustc_abi::Scalar,
+            layout: TyAndLayout<'tcx>,
+            offset: rustc_abi::Size,
+        ) {
+            if bx.cx.sess().opts.optimize == OptLevel::No {
+                // Don't emit metadata we're not going to use
+                return;
+            }
 
-        let val = if place.val.llextra.is_some() {
+            if !scalar.is_uninit_valid() {
+                // bx.noundef_metadata(load);
+            }
+
+            match scalar.primitive() {
+                rustc_abi::Primitive::Int(..) => {
+                    if !scalar.is_always_valid(bx) {
+                        bx.range_metadata(load, scalar.valid_range(bx));
+                    }
+                }
+                rustc_abi::Primitive::Pointer(_) => {
+                    if !scalar.valid_range(bx).contains(0) {
+                        bx.nonnull_metadata(load);
+                    }
+
+                    if let Some(pointee) = layout.pointee_info_at(bx, offset) {
+                        if let Some(_) = pointee.safe {
+                            // bx.align_metadata(load, pointee.align);
+                        }
+                    }
+                }
+                rustc_abi::Primitive::Float(_) => {}
+            }
+        }
+
+        let val = if let Some(_) = place.val.llextra {
             // FIXME: Merge with the `else` below?
             OperandValue::Ref(place.val)
         } else if self.is_backend_immediate(place.layout) {
-            let load = self.load(
-                self.backend_type(place.layout),
-                place.val.llval,
-                place.val.align,
-            );
+            let llty = ty_to_jcc_ty(self.cx, &place.layout);
 
-            OperandValue::Immediate(
-                if let BackendRepr::Scalar(ref scalar) = place.layout.backend_repr {
-                    self.to_immediate_scalar(load, *scalar)
+            let const_llval = None;
+            // TODO: try read constant
+            // unsafe {
+            //     if let IrBuildValue::GlbAddr { glb, .. } = place.val.llval {
+            //         if llvm::LLVMIsGlobalConstant(global) == llvm::True {
+            //             if let Some(init) = llvm::LLVMGetInitializer(global) {
+            //                 if self.val_ty(init) == llty {
+            //                     const_llval = Some(init);
+            //                 }
+            //             }
+            //         }
+            //     }
+            // }
+
+            let llval = const_llval.unwrap_or_else(|| {
+                let load = self.load(llty, place.val.llval, place.val.align);
+
+                if let rustc_abi::BackendRepr::Scalar(scalar) = place.layout.backend_repr {
+                    scalar_load_metadata(self, load, scalar, place.layout, rustc_abi::Size::ZERO);
+                    self.to_immediate_scalar(load, scalar)
                 } else {
                     load
-                },
-            )
-        } else if let BackendRepr::ScalarPair(ref a, ref b) = place.layout.backend_repr {
+                }
+            });
+            OperandValue::Immediate(llval)
+        } else if let rustc_abi::BackendRepr::ScalarPair(a, b) = place.layout.backend_repr {
             let b_offset = a.size(self).align_to(b.align(self).abi);
-            let mut load = |i: i32, scalar: &rustc_abi::Scalar, align| {
+            let mut load = |i, scalar: rustc_abi::Scalar, layout, align, offset| {
                 let llptr = if i == 0 {
                     place.val.llval
                 } else {
                     self.inbounds_ptradd(place.val.llval, self.const_usize(b_offset.bytes()))
                 };
 
-                let llty = ty_to_jcc_ty(self.cx, &place.layout);
+                let llty = scalar_pair_element_to_jcc_ty(self, &place.layout, i, false);
                 let load = self.load(llty, llptr, align);
 
-                if scalar.is_bool() {
-                    self.trunc(load, self.type_i1())
-                } else {
-                    load
-                }
+                scalar_load_metadata(self, load, scalar, layout, offset);
+                self.to_immediate_scalar(load, scalar)
             };
+
             OperandValue::Pair(
-                load(0, a, place.val.align),
-                load(1, b, place.val.align.restrict_for_offset(b_offset)),
+                load(0, a, place.layout, place.val.align, rustc_abi::Size::ZERO),
+                load(
+                    1,
+                    b,
+                    place.layout,
+                    place.val.align.restrict_for_offset(b_offset),
+                    b_offset,
+                ),
             )
         } else {
             OperandValue::Ref(place.val)
@@ -1009,9 +1068,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let base = self.mk_op(base);
         let index = self.mk_op(index);
 
-        let op = self.alloc_next_op();
-        op.mk_addr_offset(AddrOffset::index(base, index, scale));
-        op.into()
+        self.mk_next_op(|op| op.mk_addr_offset(AddrOffset::index(base, index, scale)))
+            .into()
     }
 
     fn inbounds_gep(
@@ -1093,7 +1151,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn bitcast(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_mov(val.var_ty(), val)).into()
     }
 
     fn intcast(&mut self, val: Self::Value, dest_ty: Self::Type, is_signed: bool) -> Self::Value {
@@ -1175,8 +1234,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
         let size = size.try_into().expect("u64 -> usize fail");
 
-        let op = self.alloc_next_op();
-        op.mk_memcpy(self.mk_op(src), self.mk_op(dst), size);
+        let src = self.mk_op(src);
+        let dst = self.mk_op(dst);
+        let op = self.mk_next_op(|op| op.mk_memcpy(src, dst, size));
     }
 
     fn memmove(
@@ -1207,8 +1267,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             todo!("non cnst size for memset");
         };
 
-        let op = self.alloc_next_op();
-        op.mk_memset(self.mk_op(ptr), fill_byte, size);
+        let ptr = self.mk_op(ptr);
+        let op = self.mk_next_op(|op| op.mk_memset(ptr, fill_byte, size));
     }
 
     fn select(
@@ -1308,7 +1368,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_invariant_load(&mut self, load: Self::Value) {
-        todo!()
+        // TODO:
     }
 
     fn lifetime_start(&mut self, ptr: Self::Value, size: rustc_abi::Size) {}
@@ -1330,9 +1390,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         //     todo!("non direct calls");
         // };
 
-        let ret = match fn_abi {
-            Some(f) => self.backend_type(f.ret.layout),
-            None => {
+        let ret = match (fn_abi, instance) {
+            (Some(f), Some(instance)) => self.abi_of(instance).2,
+            _ => {
                 let Some(fun) = llty.fun() else {
                     bug!("could not deduce return type (fn_abi None, and llty was not fun ty)");
                 };
