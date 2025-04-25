@@ -34,8 +34,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::jcc::{
     alloc::ArenaAlloc,
     ir::{
-        AddrOffset, AsIrRaw, IrBasicBlock, IrCnst, IrCnstTy, IrFloatTy, IrFunc, IrGlb, IrId,
-        IrIntTy, IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy,
+        IrBasicBlock, IrCnst, IrCnstTy, IrFunc, IrGlb, IrLinkage, IrOp, IrUnit, IrVarTy, IrVarTyAggregate, IrVarTyAggregateTy,
         IrVarTyFuncFlags, IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
     },
 };
@@ -199,7 +198,7 @@ pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -
     let normal_ty = cx.tcx.erase_regions(*ty);
 
     if *ty != normal_ty {
-        let mut layout = cx.layout_of(normal_ty);
+        let layout = cx.layout_of(normal_ty);
 
         ty_to_jcc_ty(cx, &layout)
     } else {

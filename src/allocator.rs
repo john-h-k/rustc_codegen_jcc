@@ -2,10 +2,9 @@ use rustc_ast::expand::allocator::{
     ALLOCATOR_METHODS, AllocatorKind, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE,
     alloc_error_handler_name, default_fn_name, global_fn_name,
 };
-use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, LayoutTypeCodegenMethods};
+use rustc_codegen_ssa::traits::BaseTypeCodegenMethods;
 use rustc_middle::bug;
 use rustc_middle::mir::mono::{Linkage, Visibility};
-use rustc_middle::ty::TyCtxt;
 use rustc_session::config::OomStrategy;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::SymbolVisibility;

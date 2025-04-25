@@ -40,8 +40,8 @@ use crate::{
     CodegenCx, JccModule,
     driver::{IrBuildValue, ty_to_jcc_ty},
     jcc::ir::{
-        AddrOffset, AsIrRaw, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrCnstTy, IrComment,
-        IrFunc, IrId, IrOp, IrUnOpTy, IrVarTy,
+        AddrOffset, HasNext, IrBasicBlock, IrBasicBlockTy, IrBinOpTy, IrComment,
+        IrFunc, IrOp, IrUnOpTy, IrVarTy,
     },
 };
 
