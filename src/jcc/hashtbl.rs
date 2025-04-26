@@ -76,7 +76,18 @@ impl<'tbl, V, VConv: NativeConvert<V>> HashTbl<'tbl, str, V, UStrConvert, VConv>
     }
 }
 
-// impl<'tbl, V, VConv: NativeConvert<V>> HashTbl<'tbl, str, V, CStrConvert, VConv> {
+impl<'tbl, K, V, KConv, VConv> HashTbl<'tbl, K, V, KConv, VConv>
+where
+    K: ?Sized,
+    V: ?Sized,
+    KConv: NativeConvert<K>,
+    VConv: NativeConvert<V>,
+{
+    pub fn len(&self) -> usize {
+        unsafe { hashtbl_size(self.ptr) }
+    }
+}
+
 impl<'tbl, K, V, KConv, VConv> HashTbl<'tbl, K, V, KConv, VConv>
 where
     K: ?Sized,
@@ -138,5 +149,5 @@ where
     }
 }
 
-type CStrHashTbl<'tbl, V> =
+pub type CStrHashTbl<'tbl, V> =
     HashTbl<'tbl, str, V, CStrConvert, <V as DefaultNativeConvert>::Default>;

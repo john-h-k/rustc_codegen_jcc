@@ -17,7 +17,7 @@ use rustc_codegen_ssa::{
         AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes,
         BaseTypeCodegenMethods, BuilderMethods, ConstCodegenMethods, CoverageInfoBuilderMethods,
         DebugInfoBuilderMethods, IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods,
-        MiscCodegenMethods, StaticBuilderMethods,
+        MiscCodegenMethods, OverflowOp, StaticBuilderMethods,
     },
 };
 use rustc_middle::{
@@ -61,6 +61,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
+    fn nop_cast(&mut self, value: IrBuildValue, dest_ty: IrVarTy) -> IrBuildValue {
+        let value = self.mk_op(value);
+        self.mk_next_op(|op| op.mk_mov(dest_ty, value)).into()
+    }
+
+    fn ptr_size(&self) -> NonZeroUsize {
+        // FIXME: ptr size
+        const { NonZeroUsize::new(8).unwrap() }
+    }
+
     fn get_block(&self) -> IrBasicBlock {
         self.cur_bb.borrow_mut().unwrap()
     }
@@ -76,17 +86,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     // marked 'mut' because 'mk_next_op' is _not_ and calling this within that closure will cause incorrect op orderings
     pub fn mk_op(&mut self, value: IrBuildValue) -> IrOp {
         match value {
-            IrBuildValue::Undf(var_ty) => self.mk_next_op(|op| op.mk_undf(var_ty)),
-            IrBuildValue::Poison(var_ty) => self.mk_next_op(|op| op.mk_undf(var_ty)),
+            IrBuildValue::Undf(var_ty) | IrBuildValue::Poison(var_ty) => {
+                if var_ty.is_primitive() {
+                    self.mk_next_op(|op| op.mk_undf(var_ty))
+                } else {
+                    let lcl = self.func.add_local(var_ty);
+                    let op = self.mk_next_op(|op| op.mk_addr_lcl(lcl));
+                    op.comment(b"undf/poison");
+                    op
+                }
+            }
 
             IrBuildValue::Op(ir_op) => ir_op,
             IrBuildValue::Cnst(ir_cnst) => self.mk_next_op(|op| op.mk_cnst(ir_cnst)),
             IrBuildValue::GlbAddr { glb, offset } => {
                 let base = self.mk_next_op(|op| op.mk_addr_glb(glb));
 
-                match NonZeroUsize::new(offset) {
-                    None => base,
-                    Some(offset) => {
+                match offset {
+                    0 => base,
+                    offset => {
                         self.mk_next_op(|op| op.mk_addr_offset(AddrOffset::offset(base, offset)))
                     }
                 }
@@ -189,11 +207,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
 
     fn assume(&mut self, val: Self::Value) {
-        todo!()
+        // TODO:
     }
 
     fn expect(&mut self, cond: Self::Value, expected: bool) -> Self::Value {
-        todo!()
+        // TODO:
+        cond
     }
 
     fn type_test(&mut self, pointer: Self::Value, typeid: Self::Metadata) -> Self::Value {
@@ -497,7 +516,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let bb = self.get_block();
         bb.mk_ty(IrBasicBlockTy::Ret);
 
+        // HACK: we should make it easier for consumers to build this (so change jcc)
+        let fun_ret_var_ty = self.func.ret_var_ty();
+
         let v = self.mk_op(v);
+        let v = if fun_ret_var_ty.is_aggregate() && v.var_ty().is_pointer() {
+            self.mk_next_op(|op| op.mk_load_addr(fun_ret_var_ty, v))
+        } else {
+            v
+        };
+
         self.mk_next_op(|op| op.mk_ret(Some(v)));
     }
 
@@ -806,19 +834,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn not(&mut self, v: Self::Value) -> Self::Value {
         let var_ty = v.var_ty();
+
+        // TODO: jcc should correctly handle ~ on i1 as !
+        let ty = if var_ty.is_i1() {
+            IrUnOpTy::LogNot
+        } else {
+            IrUnOpTy::Not
+        };
+
         let v = self.mk_op(v);
-        self.mk_next_op(|op| op.mk_unnop(IrUnOpTy::Not, var_ty, v))
-            .into()
+        self.mk_next_op(|op| op.mk_unnop(ty, var_ty, v)).into()
     }
 
     fn checked_binop(
         &mut self,
-        oop: rustc_codegen_ssa::traits::OverflowOp,
+        oop: OverflowOp,
         ty: Ty<'_>,
         lhs: Self::Value,
         rhs: Self::Value,
     ) -> (Self::Value, Self::Value) {
-        todo!()
+        // FIXME: actually check
+        let op = match oop {
+            OverflowOp::Add => self.add(lhs, rhs),
+            OverflowOp::Sub => self.sub(lhs, rhs),
+            OverflowOp::Mul => self.mul(lhs, rhs),
+        };
+
+        (op, IrBuildValue::cnst_int(self.type_i1(), 0))
     }
 
     fn from_immediate(&mut self, val: Self::Value) -> Self::Value {
@@ -873,7 +915,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         order: rustc_codegen_ssa::common::AtomicOrdering,
         size: rustc_abi::Size,
     ) -> Self::Value {
-        todo!()
+        // FIXME: faked
+        self.load(ty, ptr, rustc_abi::Align::EIGHT)
     }
 
     fn load_operand(
@@ -1051,7 +1094,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         order: rustc_codegen_ssa::common::AtomicOrdering,
         size: rustc_abi::Size,
     ) {
-        todo!()
+        // okay we are gonna fake this for noe
+        // FIXME: impl here + jcc
+        self.store(val, ptr, rustc_abi::Align::EIGHT);
     }
 
     fn gep(&mut self, ty: Self::Type, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value {
@@ -1086,6 +1131,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if dest_ty.is_i1() && src_ty.is_i8() {
             // same size, but we need to generate an AND
             // TODO: make jcc support `i1 = trunc i8`
+            // FIXME: this AND will not have right type!
             let mask = self.mk_next_op(|op| op.mk_cnst_int(src_ty, 1));
             return self.and(val, mask.into());
         }
@@ -1095,6 +1141,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
+        if val.var_ty().is_i1() {
+            bug!("sext i1 is meaninglesss");
+        }
+
         let val = self.mk_op(val);
         self.mk_next_op(|op| op.mk_sext(dest_ty, val)).into()
     }
@@ -1143,11 +1193,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn ptrtoint(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_mov(val.var_ty(), val)).into()
     }
 
     fn inttoptr(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        todo!()
+        let val = self.mk_op(val);
+        self.mk_next_op(|op| op.mk_mov(val.var_ty(), val)).into()
     }
 
     fn bitcast(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
@@ -1168,8 +1220,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn pointercast(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
-        // nop
-        val
+        self.nop_cast(val, dest_ty)
     }
 
     fn icmp(&mut self, op: IntPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
@@ -1277,7 +1328,29 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         then_val: Self::Value,
         else_val: Self::Value,
     ) -> Self::Value {
-        todo!()
+        let cond = self.mk_op(cond);
+        let then_val = self.mk_op(then_val);
+        let else_val = self.mk_op(else_val);
+
+        if cond.var_ty().is_i1()
+            && then_val.get_int_cnst().is_some_and(|c| c.val == 1)
+            && else_val.get_int_cnst().is_some_and(|c| c.val == 0)
+        {
+            return self.zext(cond.into(), then_val.var_ty());
+        }
+
+        if cond.var_ty().is_i1()
+            && then_val.get_int_cnst().is_some_and(|c| c.val == 0)
+            && else_val.get_int_cnst().is_some_and(|c| c.val == 1)
+        {
+            let not = self.not(cond.into());
+            return self.zext(not, then_val.var_ty());
+        }
+
+        let var_ty = then_val.var_ty();
+
+        self.mk_next_op(|op| op.mk_select(var_ty, cond, then_val, else_val))
+            .into()
     }
 
     fn va_arg(&mut self, list: Self::Value, ty: Self::Type) -> Self::Value {
@@ -1293,11 +1366,38 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn extract_value(&mut self, agg_val: Self::Value, idx: u64) -> Self::Value {
-        todo!()
+        // pairs are a lie, just a load
+        // we _know_ offset is ptr-size
+
+        let agg_val = self.mk_op(agg_val);
+        let addr = {
+            match idx {
+                0 => agg_val,
+                1 => self.mk_next_op(|op| {
+                    op.mk_addr_offset(AddrOffset::offset(agg_val, self.ptr_size().get()))
+                }),
+                _ => bug!("expected pair"),
+            }
+        };
+
+        self.load(self.type_ptr(), addr.into(), rustc_abi::Align::EIGHT);
+        agg_val.into()
     }
 
     fn insert_value(&mut self, agg_val: Self::Value, elt: Self::Value, idx: u64) -> Self::Value {
-        todo!()
+        let agg_val = self.mk_op(agg_val);
+        let addr = {
+            match idx {
+                0 => agg_val,
+                1 => self.mk_next_op(|op| {
+                    op.mk_addr_offset(AddrOffset::offset(agg_val, self.ptr_size().get()))
+                }),
+                _ => bug!("expected pair"),
+            }
+        };
+
+        self.store(elt, addr.into(), rustc_abi::Align::EIGHT);
+        agg_val.into()
     }
 
     fn set_personality_fn(&mut self, personality: Self::Value) {
@@ -1405,7 +1505,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let args = args.iter().map(|&a| self.mk_op(a)).collect::<Vec<_>>();
 
         let op = self.mk_next_op(|op| op.mk_call(llty, target, &args, ret));
-        op.into()
+
+        if ret.is_aggregate() {
+            // need to spill
+            let lcl = self.func.add_local(ret);
+            let addr = self.mk_next_op(|op| op.mk_addr_lcl(lcl));
+            self.store(op.into(), addr.into(), rustc_abi::Align::EIGHT);
+
+            addr.into()
+        } else {
+            op.into()
+        }
     }
 
     fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value) {

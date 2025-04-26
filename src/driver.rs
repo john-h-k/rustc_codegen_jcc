@@ -4,10 +4,13 @@ use rustc_abi::{
     BackendRepr, FieldsShape, Float, HasDataLayout, Integer, Primitive, Scalar, Variants,
     WrappingRange,
 };
-use rustc_codegen_ssa::traits::{
-    AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods, ConstCodegenMethods,
-    DebugInfoCodegenMethods, LayoutTypeCodegenMethods, MiscCodegenMethods, PreDefineCodegenMethods,
-    StaticCodegenMethods, TypeMembershipCodegenMethods,
+use rustc_codegen_ssa::{
+    common::TypeKind,
+    traits::{
+        AsmCodegenMethods, BackendTypes, BaseTypeCodegenMethods, ConstCodegenMethods,
+        DebugInfoCodegenMethods, LayoutTypeCodegenMethods, MiscCodegenMethods,
+        PreDefineCodegenMethods, StaticCodegenMethods, TypeMembershipCodegenMethods,
+    },
 };
 use rustc_const_eval::interpret::{
     self, Allocation, ConstAllocation, GlobalAlloc, InitChunk, Pointer, read_target_uint,
@@ -35,8 +38,8 @@ use crate::jcc::{
     alloc::ArenaAlloc,
     ir::{
         IrBasicBlock, IrCnst, IrCnstTy, IrFunc, IrGlb, IrLinkage, IrOp, IrUnit, IrVarTy,
-        IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags, IrVarValue, IrVarValueAddr,
-        IrVarValueListEl, IrVarValueTy,
+        IrVarTyAggregate, IrVarTyAggregateTy, IrVarTyFuncFlags, IrVarTyPrimitive, IrVarTyTy,
+        IrVarValue, IrVarValueAddr, IrVarValueListEl, IrVarValueTy,
     },
 };
 
@@ -533,6 +536,13 @@ impl IrBuildValue {
     pub fn glb_addr_with_offset(glb: IrGlb, offset: usize) -> Self {
         Self::GlbAddr { glb, offset }
     }
+
+    pub fn cnst_int(var_ty: IrVarTy, val: u64) -> Self {
+        Self::Cnst(IrCnst {
+            var_ty,
+            cnst: IrCnstTy::Int(val),
+        })
+    }
 }
 
 impl PartialEq for IrBuildValue {
@@ -655,6 +665,18 @@ impl CodegenCx<'_> {
 
         self.type_array(unit, size / unit_size)
     }
+
+    fn type_i_by_width(&self, bit_width: u64) -> IrVarTy {
+        match bit_width {
+            1 => self.type_i1(),
+            8 => self.type_i8(),
+            16 => self.type_i16(),
+            32 => self.type_i32(),
+            64 => self.type_i64(),
+            128 => self.type_i128(),
+            _ => bug!("bad bit width {bit_width}"),
+        }
+    }
 }
 
 impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
@@ -707,8 +729,23 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
         self.unit.var_ty_func(args, &ret, IrVarTyFuncFlags::None)
     }
 
-    fn type_kind(&self, ty: Self::Type) -> rustc_codegen_ssa::common::TypeKind {
-        todo!()
+    fn type_kind(&self, ty: Self::Type) -> TypeKind {
+        match ty.ty() {
+            IrVarTyTy::None => TypeKind::Void,
+            IrVarTyTy::Pointer => TypeKind::Pointer,
+            IrVarTyTy::Primitive => match ty.primitive() {
+                Some(IrVarTyPrimitive::F16) => TypeKind::Half,
+                Some(IrVarTyPrimitive::F32) => TypeKind::Float,
+                Some(IrVarTyPrimitive::F64) => TypeKind::Double,
+                Some(..) => {
+                    assert!(ty.is_int(), "unsupported prim");
+                    TypeKind::Integer
+                }
+                None => unreachable!(),
+            },
+            IrVarTyTy::Func => TypeKind::Function,
+            IrVarTyTy::Struct | IrVarTyTy::Union => TypeKind::Struct,
+        }
     }
 
     fn type_ptr(&self) -> Self::Type {
@@ -728,11 +765,11 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
 
     fn float_width(&self, ty: Self::Type) -> usize {
-        todo!()
+        ty.primitive().unwrap().bit_width()
     }
 
     fn int_width(&self, ty: Self::Type) -> u64 {
-        todo!()
+        ty.primitive().unwrap().bit_width() as _
     }
 
     fn val_ty(&self, v: Self::Value) -> Self::Type {
@@ -1062,11 +1099,16 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         llty: Self::Type,
     ) -> Self::Value {
         match cv {
-            interpret::Scalar::Int(scalar_int) => {
-                // TODO: handle properly
-                let value = scalar_int.to_bits_unchecked() as u64;
+            interpret::Scalar::Int(int) => {
+                let bit_width = if layout.is_bool() {
+                    1
+                } else {
+                    layout.size(self).bits()
+                };
 
-                self.const_u64(value)
+                let value = int.to_bits(layout.size(self));
+                let var_ty = self.type_i_by_width(bit_width);
+                self.const_uint_big(var_ty, value)
             }
             interpret::Scalar::Ptr(ptr, _size) => {
                 let (prov, offset) = ptr.into_parts();
@@ -1233,7 +1275,10 @@ impl<'tcx> CodegenCx<'tcx> {
                     bug!("expected Pair to be struct aggregate with two fields");
                 };
 
-                SmallVec::from_slice(fields)
+                smallvec![
+                    scalar_pair_element_to_jcc_ty(self, &arg.layout, 0, true),
+                    scalar_pair_element_to_jcc_ty(self, &arg.layout, 1, true),
+                ]
             }
             PassMode::Cast { pad_i32, cast } => todo!(),
             PassMode::Indirect {
@@ -1309,16 +1354,13 @@ impl<'tcx> CodegenCx<'tcx> {
         let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
 
         // TODO: visibility
-        let glb = if defined {
-            let glb = self
-                .unit
-                .add_global_def_func(fun_ty, symbol_name, linkage.into());
-            self.build_fn_params(glb.func(), params);
-            glb
-        } else {
-            self.unit
-                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
-        };
+        let glb = self
+            .unit
+            .add_global_undef_func(fun_ty, symbol_name, linkage.into());
+
+        if defined {
+            self.ensure_defined(glb, &params);
+        }
 
         self.glb_map
             .borrow_mut()
@@ -1344,16 +1386,9 @@ impl<'tcx> CodegenCx<'tcx> {
         let fun_ty = self.unit.var_ty_func(params, ret, IrVarTyFuncFlags::None);
 
         // TODO: visibility
-        let glb = if self.tcx.is_codegened_item(instance.def_id()) {
-            let glb = self
-                .unit
-                .add_global_def_func(fun_ty, symbol_name, linkage.into());
-            self.build_fn_params(glb.func(), params);
-            glb
-        } else {
-            self.unit
-                .add_global_undef_func(fun_ty, symbol_name, linkage.into())
-        };
+        let glb = self
+            .unit
+            .add_global_undef_func(fun_ty, symbol_name, linkage.into());
 
         self.glb_map
             .borrow_mut()
@@ -1384,6 +1419,14 @@ impl<'tcx> CodegenCx<'tcx> {
 
         bb
     }
+
+    fn ensure_defined(&self, fun: IrGlb, params: &[IrVarTy]) {
+        if !fun.is_def() {
+            fun.mk_def();
+
+            self.build_fn_params(fun.func(), params);
+        }
+    }
 }
 
 impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
@@ -1406,7 +1449,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     ) {
         let (_, params, ret) = self.abi_of(instance);
 
-        self.declare_fn(
+        let fun = self.declare_fn(
             instance,
             linkage,
             visibility,
@@ -1414,6 +1457,8 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             &params[..],
             &ret,
         );
+
+        self.ensure_defined(fun, &params);
     }
 }
 

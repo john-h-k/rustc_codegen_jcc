@@ -3,6 +3,7 @@ use std::{
     ffi::{CString, c_char, c_int},
     fmt::{Debug, Formatter},
     io::{self, Stderr},
+    mem,
     num::NonZeroUsize,
     os::fd::AsRawFd,
     ptr::{self, NonNull},
@@ -60,7 +61,7 @@ impl Debug for ir_object {
         writeln!(f)?;
         let stderr = OwnedCFile::stderr();
         unsafe {
-            debug_print_ir_object(stderr.ptr, self);
+            debug_print_ir_object(stderr.ptr, self, &debug_print_ir_opts::default());
         }
 
         Ok(())
@@ -403,6 +404,35 @@ impl IrGlb {
         p.def_ty == IR_GLB_DEF_TY_DEFINED
     }
 
+    pub fn mk_def(&self) {
+        unsafe {
+            let p = self.0.as_ptr().as_mut_unchecked();
+            let unit = self.unit();
+            let arena = unit.mk_arena();
+
+            let var_ty = p.var_ty;
+            let name = p.name;
+
+            // TODO: linkage
+            (*p).def_ty = IR_GLB_DEF_TY_DEFINED;
+            (*p)._1.func = arena.alloc::<ir_func>();
+
+            *(*p)._1.func = ir_func {
+                unit: unit.as_mut_ptr(),
+                func_ty: var_ty._1.func,
+                name,
+                arena: arena.as_ptr(),
+                flags: IR_FUNC_FLAG_NONE,
+                ..Default::default()
+            };
+        }
+    }
+
+    pub fn unit(&self) -> IrUnit {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+        IrUnit::from_raw(p.unit)
+    }
+
     pub fn var(&self) -> IrVar {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
@@ -627,6 +657,13 @@ impl IrFunc {
         IrUnit::from_non_null(unsafe { NonNull::new_unchecked(p.unit) })
     }
 
+    pub fn ret_var_ty(&self) -> IrVarTy {
+        unsafe {
+            let p = self.0.as_ptr().as_mut_unchecked();
+            IrVarTy(*p.func_ty.ret_ty)
+        }
+    }
+
     pub fn mk_param_stmt(&self) -> IrStmt {
         // TODO: ensure not called twice
         let bb = self.first().unwrap_or_else(|| self.alloc_basicblock());
@@ -742,7 +779,8 @@ impl IrBasicBlock {
                     default_target,
                     cases,
                 } => {
-                    let split_cases = arena.alloc_slice::<ir_split_case>(cases.len());
+                    let num_cases = cases.len();
+                    let split_cases = arena.alloc_slice::<ir_split_case>(num_cases);
 
                     for (i, &(value, target)) in cases.iter().enumerate() {
                         split_cases.add(i).write(ir_split_case {
@@ -754,7 +792,7 @@ impl IrBasicBlock {
                     ir_make_basicblock_switch(
                         f,
                         p,
-                        cases.len(),
+                        num_cases,
                         split_cases,
                         default_target.as_mut_ptr(),
                     )
@@ -851,14 +889,14 @@ pub struct AddrOffset {
     base: IrOp,
     index: Option<IrOp>,
     scale: usize,
-    offset: Option<NonZeroUsize>,
+    offset: usize,
 }
 
 impl AddrOffset {
-    pub fn offset(base: IrOp, offset: NonZeroUsize) -> Self {
+    pub fn offset(base: IrOp, offset: usize) -> Self {
         Self {
             base,
-            offset: Some(offset),
+            offset,
             index: None,
             scale: 0,
         }
@@ -869,21 +907,16 @@ impl AddrOffset {
             base,
             index: Some(index),
             scale: scale.get(),
-            offset: None,
+            offset: 0,
         }
     }
 
-    pub fn index_offset(
-        base: IrOp,
-        index: IrOp,
-        scale: NonZeroUsize,
-        offset: NonZeroUsize,
-    ) -> Self {
+    pub fn index_offset(base: IrOp, index: IrOp, scale: NonZeroUsize, offset: usize) -> Self {
         Self {
             base,
             index: Some(index),
             scale: scale.into(),
-            offset: Some(offset),
+            offset,
         }
     }
 }
@@ -1189,6 +1222,18 @@ impl IrOp {
         }
     }
 
+    pub fn mk_select(&self, IrVarTy(var_ty): IrVarTy, cond: IrOp, true_op: IrOp, false_op: IrOp) {
+        let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        p.ty = IR_OP_TY_SELECT;
+        p.var_ty = var_ty;
+        p._1.select = ir_op_select {
+            cond: cond.as_mut_ptr(),
+            true_op: true_op.as_mut_ptr(),
+            false_op: false_op.as_mut_ptr(),
+        };
+    }
+
     pub fn mk_memset(&self, addr: IrOp, value: u8, length: usize) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
@@ -1315,8 +1360,20 @@ impl IrOp {
         }
     }
 
-    pub fn mk_addr_offset(&self, addr_offset: AddrOffset) {
+    pub fn mk_addr_offset(&self, mut addr_offset: AddrOffset) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
+
+        // TODO: jcc should do this (cnst * 1 -> offset)
+        if let AddrOffset {
+            base,
+            index: Some(index),
+            scale: 1,
+            offset,
+        } = addr_offset
+            && let Some(val) = index.get_int_cnst()
+        {
+            addr_offset = AddrOffset::offset(base, val.val as usize + offset)
+        };
 
         unsafe {
             p.ty = IR_OP_TY_ADDR_OFFSET;
@@ -1328,7 +1385,7 @@ impl IrOp {
                     .map(|p| p.as_mut_ptr())
                     .unwrap_or(ptr::null_mut()),
                 scale: addr_offset.scale,
-                offset: addr_offset.offset.map(|o| o.into()).unwrap_or(0usize),
+                offset: addr_offset.offset,
             };
         }
     }
@@ -1417,21 +1474,11 @@ impl IrUnit {
             debug_assert!(var_ty.ty == IR_VAR_TY_TY_FUNC, "expected func ty");
 
             let glb = ir_add_global(unit, IR_GLB_TY_FUNC, &var_ty, IR_GLB_DEF_TY_DEFINED, name);
+            let glb = IrGlb::from_raw(glb);
 
-            // TODO: linkage
-            (*glb).linkage = linkage as _;
-            (*glb)._1.func = arena.alloc::<ir_func>();
+            glb.mk_def();
 
-            *(*glb)._1.func = ir_func {
-                unit,
-                func_ty: var_ty._1.func,
-                name,
-                arena: arena.as_ptr(),
-                flags: IR_FUNC_FLAG_NONE,
-                ..Default::default()
-            };
-
-            IrGlb(NonNull::new(glb).unwrap())
+            glb
         }
     }
 }
@@ -1461,7 +1508,58 @@ pub struct IrVarTyInfo {
     pub alignment: usize,
 }
 
+#[repr(u32)]
+pub enum IrVarTyTy {
+    None = IR_VAR_TY_TY_NONE,
+    Pointer = IR_VAR_TY_TY_POINTER,
+    Primitive = IR_VAR_TY_TY_PRIMITIVE,
+    Func = IR_VAR_TY_TY_FUNC,
+    Struct = IR_VAR_TY_TY_STRUCT,
+    Union = IR_VAR_TY_TY_UNION,
+}
+
+#[repr(u32)]
+pub enum IrVarTyPrimitive {
+    I1 = IR_VAR_PRIMITIVE_TY_I1,
+    I8 = IR_VAR_PRIMITIVE_TY_I8,
+    I16 = IR_VAR_PRIMITIVE_TY_I16,
+    I32 = IR_VAR_PRIMITIVE_TY_I32,
+    I64 = IR_VAR_PRIMITIVE_TY_I64,
+    I128 = IR_VAR_PRIMITIVE_TY_I128,
+    F16 = IR_VAR_PRIMITIVE_TY_F16,
+    F32 = IR_VAR_PRIMITIVE_TY_F32,
+    F64 = IR_VAR_PRIMITIVE_TY_F64,
+}
+
+impl IrVarTyPrimitive {
+    pub fn bit_width(&self) -> usize {
+        match self {
+            IrVarTyPrimitive::I1 => 1,
+            IrVarTyPrimitive::I8 => 8,
+            IrVarTyPrimitive::I16 => 16,
+            IrVarTyPrimitive::I32 => 32,
+            IrVarTyPrimitive::I64 => 64,
+            IrVarTyPrimitive::I128 => 128,
+            IrVarTyPrimitive::F16 => 16,
+            IrVarTyPrimitive::F32 => 32,
+            IrVarTyPrimitive::F64 => 64,
+        }
+    }
+}
+
 impl IrVarTy {
+    pub fn ty(&self) -> IrVarTyTy {
+        match self.0.ty {
+            IR_VAR_TY_TY_NONE => IrVarTyTy::None,
+            IR_VAR_TY_TY_POINTER => IrVarTyTy::Pointer,
+            IR_VAR_TY_TY_PRIMITIVE => IrVarTyTy::Primitive,
+            IR_VAR_TY_TY_FUNC => IrVarTyTy::Func,
+            IR_VAR_TY_TY_STRUCT => IrVarTyTy::Struct,
+            IR_VAR_TY_TY_UNION => IrVarTyTy::Union,
+            _ => panic!("bad ty"),
+        }
+    }
+
     pub fn ty_none() -> IrVarTy {
         IrVarTy(unsafe { IR_VAR_TY_NONE })
     }
@@ -1535,6 +1633,10 @@ impl IrVarTy {
         Some(IrVarTyAggregate { ty, fields })
     }
 
+    pub fn is_pointer(&self) -> bool {
+        matches!(self.0.ty, IR_VAR_TY_TY_POINTER)
+    }
+
     pub fn is_aggregate(&self) -> bool {
         matches!(self.0.ty, IR_VAR_TY_TY_STRUCT | IR_VAR_TY_TY_UNION)
     }
@@ -1545,28 +1647,50 @@ impl IrVarTy {
         unsafe { self.0._1.primitive.cmp(&other.0._1.primitive) }
     }
 
-    fn primitive(&self) -> u32 {
-        debug_assert_eq!(self.0.ty, IR_VAR_TY_TY_PRIMITIVE);
-        unsafe { self.0._1.primitive }
+    pub fn is_primitive(&self) -> bool {
+        self.primitive().is_some()
+    }
+
+    pub fn primitive(&self) -> Option<IrVarTyPrimitive> {
+        let IR_VAR_TY_TY_PRIMITIVE = self.0.ty else {
+            return None;
+        };
+
+        // SAFETY: #[repr(u32)]
+        Some(unsafe { mem::transmute(self.0._1.primitive) })
     }
 
     pub fn is_i1(&self) -> bool {
-        matches!(self.primitive(), IR_VAR_PRIMITIVE_TY_I1)
+        matches!(self.primitive(), Some(IrVarTyPrimitive::I1))
     }
 
     pub fn is_i8(&self) -> bool {
-        matches!(self.primitive(), IR_VAR_PRIMITIVE_TY_I8)
+        matches!(self.primitive(), Some(IrVarTyPrimitive::I8))
+    }
+
+    pub fn is_f16(&self) -> bool {
+        matches!(self.primitive(), Some(IrVarTyPrimitive::F16))
+    }
+
+    pub fn is_f32(&self) -> bool {
+        matches!(self.primitive(), Some(IrVarTyPrimitive::F32))
+    }
+
+    pub fn is_f64(&self) -> bool {
+        matches!(self.primitive(), Some(IrVarTyPrimitive::F64))
     }
 
     pub fn is_int(&self) -> bool {
         matches!(
             self.primitive(),
-            IR_VAR_PRIMITIVE_TY_I1
-                | IR_VAR_PRIMITIVE_TY_I8
-                | IR_VAR_PRIMITIVE_TY_I16
-                | IR_VAR_PRIMITIVE_TY_I32
-                | IR_VAR_PRIMITIVE_TY_I64
-                | IR_VAR_PRIMITIVE_TY_I128
+            Some(
+                IrVarTyPrimitive::I1
+                    | IrVarTyPrimitive::I8
+                    | IrVarTyPrimitive::I16
+                    | IrVarTyPrimitive::I32
+                    | IrVarTyPrimitive::I64
+                    | IrVarTyPrimitive::I128
+            )
         )
     }
 
