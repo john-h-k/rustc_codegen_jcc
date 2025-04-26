@@ -130,21 +130,21 @@ impl<'jcc> IrUnit<'jcc> {
         ArenaAllocRef::from_raw(unsafe { self.ptr.as_ref().arena })
     }
 
-    pub fn var_ty_none(&self) -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_NONE })
+    pub fn var_ty_none(&self) -> IrVarTy<'jcc> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_NONE })
     }
 
-    pub fn var_ty_pointer(&self) -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_POINTER })
+    pub fn var_ty_pointer(&self) -> IrVarTy<'jcc> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_POINTER })
     }
 
-    pub fn var_ty_fat_pointer(&self) -> IrVarTy {
+    pub fn var_ty_fat_pointer(&self) -> IrVarTy<'jcc> {
         // TODO: cache
         let fields = unsafe { [IR_VAR_TY_POINTER, IR_VAR_TY_POINTER] };
         let num_fields = fields.len();
         let fields = self.mk_arena().alloc_slice_copy(&fields);
 
-        IrVarTy(ir_var_ty {
+        IrVarTy::from_raw(ir_var_ty {
             ty: IR_VAR_TY_TY_STRUCT,
             _1: ir_var_ty__bindgen_ty_1 {
                 aggregate: ir_var_aggregate_ty { fields, num_fields },
@@ -152,15 +152,15 @@ impl<'jcc> IrUnit<'jcc> {
         })
     }
 
-    pub fn var_ty_bytes(&self, size: usize) -> IrVarTy {
+    pub fn var_ty_bytes(&self, size: usize) -> IrVarTy<'jcc> {
         self.var_ty_array(&self.var_ty_integer(IrIntTy::I8), size)
     }
 
-    pub fn var_ty_array(&self, IrVarTy(el): &IrVarTy, len: usize) -> IrVarTy {
-        IrVarTy(unsafe { ir_var_ty_mk_array(self.ptr.as_ref(), el, len) })
+    pub fn var_ty_array(&self, IrVarTy(el, ..): &IrVarTy, len: usize) -> IrVarTy<'jcc> {
+        IrVarTy::from_raw(unsafe { ir_var_ty_mk_array(self.ptr.as_ref(), el, len) })
     }
 
-    pub fn var_ty_union(&self, fields: &[IrVarTy]) -> IrVarTy {
+    pub fn var_ty_union(&self, fields: &[IrVarTy]) -> IrVarTy<'jcc> {
         let arena = self.mk_arena();
 
         let num_fields = fields.len();
@@ -169,7 +169,7 @@ impl<'jcc> IrUnit<'jcc> {
         // SAFETY: IrVarTy is repr(transparent) over ir_var_ty
         let fields = fields.cast::<ir_var_ty>();
 
-        IrVarTy(ir_var_ty {
+        IrVarTy::from_raw(ir_var_ty {
             ty: IR_VAR_TY_TY_UNION,
             _1: ir_var_ty__bindgen_ty_1 {
                 aggregate: ir_var_aggregate_ty { num_fields, fields },
@@ -177,7 +177,7 @@ impl<'jcc> IrUnit<'jcc> {
         })
     }
 
-    pub fn var_ty_struct(&self, fields: &[IrVarTy]) -> IrVarTy {
+    pub fn var_ty_struct(&self, fields: &[IrVarTy]) -> IrVarTy<'jcc> {
         let arena = self.mk_arena();
 
         let num_fields = fields.len();
@@ -186,7 +186,7 @@ impl<'jcc> IrUnit<'jcc> {
         // SAFETY: IrVarTy is repr(transparent) over ir_var_ty
         let fields = fields.cast::<ir_var_ty>();
 
-        IrVarTy(ir_var_ty {
+        IrVarTy::from_raw(ir_var_ty {
             ty: IR_VAR_TY_TY_STRUCT,
             _1: ir_var_ty__bindgen_ty_1 {
                 aggregate: ir_var_aggregate_ty { num_fields, fields },
@@ -199,7 +199,7 @@ impl<'jcc> IrUnit<'jcc> {
         params: &[IrVarTy],
         ret: &IrVarTy,
         flags: IrVarTyFuncFlags,
-    ) -> IrVarTy {
+    ) -> IrVarTy<'jcc> {
         let arena = self.mk_arena();
         let params_ptr = arena.alloc_slice_copy(params);
         let ret_ptr = arena.alloc_copy(ret);
@@ -208,7 +208,7 @@ impl<'jcc> IrUnit<'jcc> {
         let params_ptr = params_ptr.cast::<ir_var_ty>();
         let ret_ptr = ret_ptr.cast::<ir_var_ty>();
 
-        IrVarTy(ir_var_ty {
+        IrVarTy::from_raw(ir_var_ty {
             ty: IR_VAR_TY_TY_FUNC,
             _1: ir_var_ty__bindgen_ty_1 {
                 func: ir_var_func_ty {
@@ -221,8 +221,8 @@ impl<'jcc> IrUnit<'jcc> {
         })
     }
 
-    pub fn var_ty_integer(&self, ty: IrIntTy) -> IrVarTy {
-        IrVarTy(unsafe {
+    pub fn var_ty_integer(&self, ty: IrIntTy) -> IrVarTy<'jcc> {
+        IrVarTy::from_raw(unsafe {
             match ty {
                 IrIntTy::I1 => IR_VAR_TY_I1,
                 IrIntTy::I8 => IR_VAR_TY_I8,
@@ -234,8 +234,8 @@ impl<'jcc> IrUnit<'jcc> {
         })
     }
 
-    pub fn var_ty_float(&self, ty: IrFloatTy) -> IrVarTy {
-        IrVarTy(unsafe {
+    pub fn var_ty_float(&self, ty: IrFloatTy) -> IrVarTy<'jcc> {
+        IrVarTy::from_raw(unsafe {
             match ty {
                 IrFloatTy::F16 => IR_VAR_TY_F16,
                 IrFloatTy::F32 => IR_VAR_TY_F32,
@@ -258,6 +258,8 @@ impl AsIrRaw for IrUnit<'_> {
 }
 
 impl FromIrRaw for IrUnit<'_> {
+    type Raw = ir_unit;
+
     fn from_non_null(ptr: NonNull<Self::Raw>) -> Self {
         Self {
             ptr,
@@ -283,7 +285,9 @@ pub trait IrComment {
     fn comment(&self, comment: &[u8]);
 }
 
-pub trait FromIrRaw: AsIrRaw {
+pub trait FromIrRaw: Sized {
+    type Raw;
+
     fn from_raw(ptr: *mut Self::Raw) -> Self {
         Self::from_non_null(NonNull::new(ptr).unwrap())
     }
@@ -345,6 +349,8 @@ macro_rules! ir_object_newtype {
         }
 
         impl FromIrRaw for $t<'_> {
+            type Raw = $ty;
+
             fn from_non_null(ptr: NonNull<Self::Raw>) -> Self {
                 Self(ptr, PhantomData)
             }
@@ -533,12 +539,12 @@ pub enum IrVarValueTy<'jcc> {
 
 pub struct IrVarValue<'jcc> {
     pub ty: IrVarValueTy<'jcc>,
-    pub var_ty: IrVarTy,
+    pub var_ty: IrVarTy<'jcc>,
 }
 
-impl IrVarValue<'_> {
+impl<'jcc> IrVarValue<'jcc> {
     // TODO: we need unit (for `var_ty_bytes` and in turn `ir_var_ty_mk_array`) but kinda ugly
-    pub fn from_bytes(unit: IrUnit, offset: usize, bytes: &[u8]) -> Self {
+    pub fn from_bytes(unit: IrUnit<'jcc>, offset: usize, bytes: &[u8]) -> Self {
         let lst = bytes
             .iter()
             .enumerate()
@@ -546,7 +552,7 @@ impl IrVarValue<'_> {
                 let offset = offset + i;
                 let value = IrVarValue {
                     ty: IrVarValueTy::Int(b.into()),
-                    var_ty: unsafe { IrVarTy(IR_VAR_TY_I8) },
+                    var_ty: unsafe { IrVarTy::from_raw(IR_VAR_TY_I8) },
                 };
 
                 IrVarValueListEl { offset, value }
@@ -566,7 +572,7 @@ pub fn mk_value(
     unit: IrUnit,
     IrVarValue {
         ty,
-        var_ty: IrVarTy(var_ty),
+        var_ty: IrVarTy(var_ty, ..),
     }: &IrVarValue,
     base: usize,
 ) -> ir_var_value {
@@ -633,7 +639,7 @@ impl IrVar<'_> {
         IrUnit::from_non_null(unsafe { NonNull::new_unchecked(p.unit) })
     }
 
-    pub fn mk_int(&self, IrVarTy(var_ty): IrVarTy, value: IrIntCnst) {
+    pub fn mk_int(&self, IrVarTy(var_ty, ..): IrVarTy, value: IrIntCnst) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         p.value = ir_var_value {
             ty: IR_VAR_VALUE_TY_INT,
@@ -659,15 +665,15 @@ impl<'jcc> IrFunc<'jcc> {
         ArenaAllocRef::from_raw(p.arena)
     }
 
-    pub fn unit(&self) -> IrUnit {
+    pub fn unit(&self) -> IrUnit<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrUnit::from_non_null(unsafe { NonNull::new_unchecked(p.unit) })
     }
 
-    pub fn ret_var_ty(&self) -> IrVarTy {
+    pub fn ret_var_ty(&self) -> IrVarTy<'jcc> {
         unsafe {
             let p = self.0.as_ptr().as_mut_unchecked();
-            IrVarTy(*p.func_ty.ret_ty)
+            IrVarTy::from_raw(*p.func_ty.ret_ty)
         }
     }
 
@@ -731,12 +737,12 @@ impl<'jcc> IrFunc<'jcc> {
         unsafe { IrBasicBlock::from_raw(ir_alloc_basicblock(p)) }
     }
 
-    pub fn add_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl<'jcc> {
+    pub fn add_local(&self, IrVarTy(var_ty, ..): IrVarTy) -> IrLcl<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrLcl::from_raw(unsafe { ir_add_local(p, &var_ty) })
     }
 
-    pub fn add_param_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl<'jcc> {
+    pub fn add_param_local(&self, IrVarTy(var_ty, ..): IrVarTy) -> IrLcl<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         let lcl = unsafe { ir_add_local(p, &var_ty) };
         (unsafe { *lcl }).flags |= IR_LCL_FLAG_PARAM;
@@ -941,8 +947,8 @@ impl<T: Into<u64>> From<T> for IrIntCnst {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct IrCnst {
-    pub var_ty: IrVarTy,
+pub struct IrCnst<'jcc> {
+    pub var_ty: IrVarTy<'jcc>,
     pub cnst: IrCnstTy,
 }
 
@@ -1004,9 +1010,9 @@ pub enum IrBinOpTy {
 }
 
 impl<'jcc> IrOp<'jcc> {
-    pub fn var_ty(&self) -> IrVarTy {
+    pub fn var_ty(&self) -> IrVarTy<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
-        IrVarTy(p.var_ty)
+        IrVarTy::from_raw(p.var_ty)
     }
 
     // hacky should have general way to do this
@@ -1123,7 +1129,7 @@ impl<'jcc> IrOp<'jcc> {
         p.flags |= IR_OP_FLAG_PARAM;
     }
 
-    pub fn mk_mov_param(&self, IrVarTy(var_ty): IrVarTy) {
+    pub fn mk_mov_param(&self, IrVarTy(var_ty, ..): IrVarTy) {
         debug_assert!(
             self.stmt().is_params(),
             "mk_mov_param must be in param stmt"
@@ -1139,7 +1145,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    pub fn mk_mov(&self, IrVarTy(var_ty): IrVarTy, op: IrOp) {
+    pub fn mk_mov(&self, IrVarTy(var_ty, ..): IrVarTy, op: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_MOV;
@@ -1149,7 +1155,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    pub fn mk_undf(&self, IrVarTy(var_ty): IrVarTy) {
+    pub fn mk_undf(&self, IrVarTy(var_ty, ..): IrVarTy) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_UNDF;
@@ -1163,7 +1169,7 @@ impl<'jcc> IrOp<'jcc> {
         }
     }
 
-    pub fn mk_cnst_int(&self, IrVarTy(var_ty): IrVarTy, value: u64) {
+    pub fn mk_cnst_int(&self, IrVarTy(var_ty, ..): IrVarTy, value: u64) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_CNST;
@@ -1174,7 +1180,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    pub fn mk_cnst_float(&self, IrVarTy(var_ty): IrVarTy, value: f64) {
+    pub fn mk_cnst_float(&self, IrVarTy(var_ty, ..): IrVarTy, value: f64) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_CNST;
@@ -1185,7 +1191,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    pub fn mk_load_addr(&self, IrVarTy(var_ty): IrVarTy, addr: IrOp) {
+    pub fn mk_load_addr(&self, IrVarTy(var_ty, ..): IrVarTy, addr: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_LOAD;
@@ -1243,7 +1249,13 @@ impl<'jcc> IrOp<'jcc> {
         }
     }
 
-    pub fn mk_select(&self, IrVarTy(var_ty): IrVarTy, cond: IrOp, true_op: IrOp, false_op: IrOp) {
+    pub fn mk_select(
+        &self,
+        IrVarTy(var_ty, ..): IrVarTy,
+        cond: IrOp,
+        true_op: IrOp,
+        false_op: IrOp,
+    ) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_SELECT;
@@ -1269,7 +1281,7 @@ impl<'jcc> IrOp<'jcc> {
         }
     }
 
-    pub fn mk_unnop(&self, ty: IrUnOpTy, IrVarTy(var_ty): IrVarTy, value: IrOp) {
+    pub fn mk_unnop(&self, ty: IrUnOpTy, IrVarTy(var_ty, ..): IrVarTy, value: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_UNARY_OP;
@@ -1280,7 +1292,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    pub fn mk_binop(&self, ty: IrBinOpTy, IrVarTy(var_ty): IrVarTy, lhs: IrOp, rhs: IrOp) {
+    pub fn mk_binop(&self, ty: IrBinOpTy, IrVarTy(var_ty, ..): IrVarTy, lhs: IrOp, rhs: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_BINARY_OP;
@@ -1292,7 +1304,7 @@ impl<'jcc> IrOp<'jcc> {
         };
     }
 
-    fn mk_cast<const CAST_TY: u32>(&self, IrVarTy(var_ty): IrVarTy, value: IrOp) {
+    fn mk_cast<const CAST_TY: u32>(&self, IrVarTy(var_ty, ..): IrVarTy, value: IrOp) {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
         p.ty = IR_OP_TY_CAST_OP;
@@ -1421,7 +1433,7 @@ pub enum IrLinkage {
 impl<'jcc> IrUnit<'jcc> {
     pub fn add_global_def_var(
         &self,
-        IrVarTy(var_ty): IrVarTy,
+        IrVarTy(var_ty, ..): IrVarTy,
         name: Option<&str>,
         linkage: IrLinkage,
     ) -> IrGlb<'jcc> {
@@ -1458,7 +1470,7 @@ impl<'jcc> IrUnit<'jcc> {
 
     pub fn add_global_undef_func(
         &self,
-        IrVarTy(var_ty): IrVarTy,
+        IrVarTy(var_ty, ..): IrVarTy,
         name: &str,
         linkage: IrLinkage,
     ) -> IrGlb<'jcc> {
@@ -1482,7 +1494,7 @@ impl<'jcc> IrUnit<'jcc> {
 
     pub fn add_global_def_func(
         &self,
-        IrVarTy(var_ty): IrVarTy,
+        IrVarTy(var_ty, ..): IrVarTy,
         name: &str,
         linkage: IrLinkage,
     ) -> IrGlb<'jcc> {
@@ -1507,21 +1519,21 @@ impl<'jcc> IrUnit<'jcc> {
 // TODO: expensive, take ref in more places
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct IrVarTy(ir_var_ty);
+pub struct IrVarTy<'jcc>(ir_var_ty, PhantomData<&'jcc ir_var_ty>);
 
 pub enum IrVarTyAggregateTy {
     Struct,
     Union,
 }
 
-pub struct IrVarTyFun<'a> {
-    pub params: &'a [IrVarTy],
-    pub ret: IrVarTy,
+pub struct IrVarTyFun<'a, 'jcc> {
+    pub params: &'a [IrVarTy<'jcc>],
+    pub ret: IrVarTy<'jcc>,
 }
 
-pub struct IrVarTyAggregate<'a> {
+pub struct IrVarTyAggregate<'a, 'jcc> {
     pub ty: IrVarTyAggregateTy,
-    pub fields: &'a [IrVarTy],
+    pub fields: &'a [IrVarTy<'jcc>],
 }
 
 pub struct IrVarTyInfo {
@@ -1568,7 +1580,11 @@ impl IrVarTyPrimitive {
     }
 }
 
-impl IrVarTy {
+impl<'jcc> IrVarTy<'jcc> {
+    fn from_raw(var_ty: ir_var_ty) -> Self {
+        Self(var_ty, PhantomData)
+    }
+
     pub fn ty(&self) -> IrVarTyTy {
         match self.0.ty {
             IR_VAR_TY_TY_NONE => IrVarTyTy::None,
@@ -1581,40 +1597,40 @@ impl IrVarTy {
         }
     }
 
-    pub fn ty_none() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_NONE })
+    pub fn ty_none() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_NONE })
     }
-    pub fn ty_pointer() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_POINTER })
-    }
-
-    pub fn ty_i1() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I1 })
-    }
-    pub fn ty_i8() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I8 })
-    }
-    pub fn ty_i16() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I16 })
-    }
-    pub fn ty_i32() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I32 })
-    }
-    pub fn ty_i64() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I64 })
-    }
-    pub fn ty_i128() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_I128 })
+    pub fn ty_pointer() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_POINTER })
     }
 
-    pub fn ty_f16() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_F16 })
+    pub fn ty_i1() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I1 })
     }
-    pub fn ty_f32() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_F32 })
+    pub fn ty_i8() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I8 })
     }
-    pub fn ty_f64() -> IrVarTy {
-        IrVarTy(unsafe { IR_VAR_TY_F64 })
+    pub fn ty_i16() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I16 })
+    }
+    pub fn ty_i32() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I32 })
+    }
+    pub fn ty_i64() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I64 })
+    }
+    pub fn ty_i128() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_I128 })
+    }
+
+    pub fn ty_f16() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_F16 })
+    }
+    pub fn ty_f32() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_F32 })
+    }
+    pub fn ty_f64() -> IrVarTy<'static> {
+        IrVarTy::from_raw(unsafe { IR_VAR_TY_F64 })
     }
     // const F128: Self = Self(unsafe { IR_VAR_TY_F128 });
 
@@ -1728,7 +1744,7 @@ impl IrVarTy {
     }
 }
 
-impl Debug for IrVarTy {
+impl Debug for IrVarTy<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
         let stderr = OwnedCFile::stderr();
@@ -1740,10 +1756,10 @@ impl Debug for IrVarTy {
     }
 }
 
-impl PartialEq for IrVarTy {
+impl PartialEq for IrVarTy<'_> {
     fn eq(&self, other: &Self) -> bool {
         unsafe { ir_var_ty_eq(&self.0, &other.0) }
     }
 }
 
-impl Eq for IrVarTy {}
+impl Eq for IrVarTy<'_> {}

@@ -142,7 +142,7 @@ impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Metadata = ();
     type Function = IrFunc<'tcx>;
     type BasicBlock = IrBasicBlock<'tcx>;
-    type Type = IrVarTy;
+    type Type = IrVarTy<'tcx>;
     type Funclet = ();
     type DIScope = ();
     type DILocation = ();

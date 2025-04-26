@@ -61,7 +61,10 @@ trait TypedDebug: Debug {
 
 impl<T: ?Sized + Debug> TypedDebug for T {}
 
-pub fn integer_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, integer: rustc_abi::Integer) -> IrVarTy {
+pub fn integer_ty_to_jcc_ty<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    integer: rustc_abi::Integer,
+) -> IrVarTy<'tcx> {
     match integer {
         Integer::I8 => cx.type_i8(),
         Integer::I16 => cx.type_i16(),
@@ -71,7 +74,7 @@ pub fn integer_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, integer: rustc_abi::Inte
     }
 }
 
-pub fn float_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, float: rustc_abi::Float) -> IrVarTy {
+pub fn float_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, float: rustc_abi::Float) -> IrVarTy<'tcx> {
     match float {
         Float::F16 => cx.type_f16(),
         Float::F32 => cx.type_f32(),
@@ -85,7 +88,7 @@ pub fn scalar_pair_element_to_jcc_ty<'tcx>(
     layout: &TyAndLayout<'tcx>,
     index: usize,
     immediate: bool,
-) -> IrVarTy {
+) -> IrVarTy<'tcx> {
     // This must produce the same result for `repr(transparent)` wrappers as for the inner type!
     // In other words, this should generally not look at the type at all, but only at the
     // layout.
@@ -112,7 +115,10 @@ pub fn scalar_pair_element_to_jcc_ty<'tcx>(
     scalar_ty_to_jcc_ty(cx, &scalar)
 }
 
-pub fn scalar_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, scalar: &rustc_abi::Scalar) -> IrVarTy {
+pub fn scalar_ty_to_jcc_ty<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    scalar: &rustc_abi::Scalar,
+) -> IrVarTy<'tcx> {
     match scalar.primitive() {
         Primitive::Int(integer, _) => integer_ty_to_jcc_ty(cx, integer),
         Primitive::Float(float) => float_ty_to_jcc_ty(cx, float),
@@ -120,7 +126,10 @@ pub fn scalar_ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, scalar: &rustc_abi::Scala
     }
 }
 
-fn struct_fields<'tcx>(cx: &CodegenCx<'tcx>, layout: &TyAndLayout<'tcx>) -> (Vec<IrVarTy>, bool) {
+fn struct_fields<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    layout: &TyAndLayout<'tcx>,
+) -> (Vec<IrVarTy<'tcx>>, bool) {
     let field_count = layout.fields.count();
     let mut packed = false;
     let mut offset = rustc_abi::Size::ZERO;
@@ -177,7 +186,7 @@ fn struct_fields<'tcx>(cx: &CodegenCx<'tcx>, layout: &TyAndLayout<'tcx>) -> (Vec
 pub fn ty_to_jcc_immediate_ty<'tcx>(
     cx: &CodegenCx<'tcx>,
     ty_layout: &TyAndLayout<'tcx>,
-) -> IrVarTy {
+) -> IrVarTy<'tcx> {
     match ty_layout.backend_repr {
         BackendRepr::Scalar(scalar) => {
             if scalar.is_bool() {
@@ -201,7 +210,7 @@ pub fn ty_to_jcc_immediate_ty<'tcx>(
     ty_to_jcc_ty(cx, ty_layout)
 }
 
-pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -> IrVarTy {
+pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -> IrVarTy<'tcx> {
     let TyAndLayout { ty, layout } = &ty_layout;
 
     // TODO: caching
@@ -374,7 +383,7 @@ impl<'tcx> CodegenCx<'tcx> {
         // must be within the bounds of `alloc` and not contain or overlap a pointer provenance.
         fn append_chunks_of_init_and_uninit_bytes<'a, 'b>(
             cx: &'a CodegenCx<'b>,
-            llvals: &mut Vec<IrVarValueListEl>,
+            llvals: &mut Vec<IrVarValueListEl<'a>>,
             alloc: &'a Allocation,
             range: Range<usize>,
         ) {
@@ -516,9 +525,9 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
 // so we need a flexible way to represent them
 #[derive(Debug, Clone, Copy)]
 pub enum IrBuildValue<'jcc> {
-    Undf(IrVarTy),
-    Poison(IrVarTy),
-    Cnst(IrCnst),
+    Undf(IrVarTy<'jcc>),
+    Poison(IrVarTy<'jcc>),
+    Cnst(IrCnst<'jcc>),
     Op(IrOp<'jcc>),
     GlbAddr { glb: IrGlb<'jcc>, offset: usize },
 }
@@ -547,14 +556,14 @@ impl<'jcc> IrBuildValue<'jcc> {
         Self::GlbAddr { glb, offset }
     }
 
-    pub fn cnst_int(var_ty: IrVarTy, val: u64) -> Self {
+    pub fn cnst_int(var_ty: IrVarTy<'jcc>, val: u64) -> Self {
         Self::Cnst(IrCnst {
             var_ty,
             cnst: IrCnstTy::Int(val),
         })
     }
 
-    pub fn var_ty(&self) -> IrVarTy {
+    pub fn var_ty(&self) -> IrVarTy<'jcc> {
         match self {
             IrBuildValue::Cnst(IrCnst { var_ty, .. }) => *var_ty,
             IrBuildValue::Op(ir_op) => ir_op.var_ty(),
@@ -569,7 +578,7 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Metadata = ();
     type Function = IrFunc<'tcx>;
     type BasicBlock = IrBasicBlock<'tcx>;
-    type Type = IrVarTy;
+    type Type = IrVarTy<'tcx>;
     type Funclet = ();
     type DIScope = ();
     type DILocation = ();
@@ -620,7 +629,7 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'tcx> {
     }
 }
 
-impl CodegenCx<'_> {
+impl<'tcx> CodegenCx<'tcx> {
     pub fn val_to_u64(&self, val: IrBuildValue) -> Option<u64> {
         match val {
             IrBuildValue::Cnst(ir_cnst) => match ir_cnst.cnst {
@@ -632,15 +641,15 @@ impl CodegenCx<'_> {
         }
     }
 
-    pub fn type_none(&self) -> IrVarTy {
+    pub fn type_none(&self) -> IrVarTy<'tcx> {
         IrVarTy::ty_none()
     }
 
-    pub fn type_i1(&self) -> IrVarTy {
+    pub fn type_i1(&self) -> IrVarTy<'tcx> {
         IrVarTy::ty_i1()
     }
 
-    pub fn type_struct(&self, fields: &[IrVarTy], packed: bool) -> IrVarTy {
+    pub fn type_struct(&self, fields: &[IrVarTy], packed: bool) -> IrVarTy<'tcx> {
         if packed {
             todo!("packed structs");
         }
@@ -648,11 +657,15 @@ impl CodegenCx<'_> {
         self.unit.var_ty_struct(fields)
     }
 
-    pub fn type_union(&self, fields: &[IrVarTy]) -> IrVarTy {
+    pub fn type_union(&self, fields: &[IrVarTy]) -> IrVarTy<'tcx> {
         self.unit.var_ty_union(fields)
     }
 
-    pub fn type_padding_filler(&self, size: rustc_abi::Size, align: rustc_abi::Align) -> IrVarTy {
+    pub fn type_padding_filler(
+        &self,
+        size: rustc_abi::Size,
+        align: rustc_abi::Align,
+    ) -> IrVarTy<'tcx> {
         let unit = Integer::approximate_align(self, align);
 
         let size = size.bytes();
@@ -665,7 +678,7 @@ impl CodegenCx<'_> {
         self.type_array(unit, size / unit_size)
     }
 
-    fn type_i_by_width(&self, bit_width: u64) -> IrVarTy {
+    fn type_i_by_width(&self, bit_width: u64) -> IrVarTy<'tcx> {
         match bit_width {
             1 => self.type_i1(),
             8 => self.type_i8(),
@@ -909,8 +922,8 @@ impl<'tcx> CodegenCx<'tcx> {
         &self,
         cv: interpret::Scalar,
         layout: rustc_abi::Scalar,
-        llty: IrVarTy,
-    ) -> IrVarValue {
+        llty: IrVarTy<'tcx>,
+    ) -> IrVarValue<'tcx> {
         match cv {
             interpret::Scalar::Int(scalar_int) => {
                 // TODO: handle properly
@@ -1258,7 +1271,7 @@ impl From<Linkage> for IrLinkage {
 
 impl<'tcx> CodegenCx<'tcx> {
     // TODO: use smallvec
-    fn abi_map_ty(&self, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> SmallVec<[IrVarTy; 2]> {
+    fn abi_map_ty(&self, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> SmallVec<[IrVarTy<'tcx>; 2]> {
         let ty = self.backend_type(arg.layout);
 
         match &arg.mode {
@@ -1301,7 +1314,10 @@ impl<'tcx> CodegenCx<'tcx> {
         }
     }
 
-    fn abi_fn_ty<'a: 'tcx>(&self, fn_abi: &FnAbi<'a, Ty<'tcx>>) -> (Vec<IrVarTy>, IrVarTy) {
+    fn abi_fn_ty<'a: 'tcx>(
+        &self,
+        fn_abi: &FnAbi<'a, Ty<'tcx>>,
+    ) -> (Vec<IrVarTy<'tcx>>, IrVarTy<'tcx>) {
         let params = &fn_abi.args;
         let ret = &fn_abi.ret;
 
@@ -1330,7 +1346,7 @@ impl<'tcx> CodegenCx<'tcx> {
     pub fn abi_of(
         &self,
         instance: Instance<'tcx>,
-    ) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy>, IrVarTy) {
+    ) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy<'tcx>>, IrVarTy<'tcx>) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (params, ret) = self.abi_fn_ty(fn_abi);
 
