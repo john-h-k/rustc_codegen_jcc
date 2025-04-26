@@ -3,6 +3,7 @@ use std::{
     ffi::{CString, c_char, c_int},
     fmt::{Debug, Formatter},
     io::{self, Stderr},
+    marker::PhantomData,
     mem,
     num::NonZeroUsize,
     os::fd::AsRawFd,
@@ -92,13 +93,14 @@ bitflags! {
 }
 
 #[derive(Clone, Copy)]
-pub struct IrUnit {
+pub struct IrUnit<'jcc> {
     ptr: NonNull<ir_unit>,
+    _data: PhantomData<&'jcc ir_unit>,
 }
 
 unsafe impl Sync for ir_var_ty {}
 
-impl IrUnit {
+impl<'jcc> IrUnit<'jcc> {
     pub fn new(arena: ArenaAllocRef) -> Self {
         let unit = ir_unit {
             arena: arena.as_ptr(),
@@ -109,7 +111,10 @@ impl IrUnit {
 
         let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(unit))) };
 
-        Self { ptr }
+        Self {
+            ptr,
+            _data: PhantomData,
+        }
     }
 
     pub fn var_ty_info(&self, var_ty: IrVarTy) -> IrVarTyInfo {
@@ -240,7 +245,7 @@ impl IrUnit {
     }
 }
 
-impl AsIrRaw for IrUnit {
+impl AsIrRaw for IrUnit<'_> {
     type Raw = ir_unit;
 
     fn as_ir_object(&self) -> ir_object {
@@ -252,9 +257,12 @@ impl AsIrRaw for IrUnit {
     }
 }
 
-impl FromIrRaw for IrUnit {
+impl FromIrRaw for IrUnit<'_> {
     fn from_non_null(ptr: NonNull<Self::Raw>) -> Self {
-        Self { ptr }
+        Self {
+            ptr,
+            _data: PhantomData,
+        }
     }
 }
 
@@ -291,17 +299,17 @@ macro_rules! ir_object_newtype {
     ($t:ident, $ty:ty, $obj:ident, $name:ident) => {
         #[derive(Clone, Copy)]
         #[repr(transparent)]
-        pub struct $t(NonNull<$ty>);
+        pub struct $t<'jcc>(NonNull<$ty>, PhantomData<&'jcc $ty>);
 
-        impl PartialEq for $t {
+        impl PartialEq for $t<'_> {
             fn eq(&self, other: &Self) -> bool {
                 ptr::eq(self.as_mut_ptr(), other.as_mut_ptr())
             }
         }
 
-        impl Eq for $t {}
+        impl Eq for $t<'_> {}
 
-        impl AsIrRaw for $t {
+        impl AsIrRaw for $t<'_> {
             type Raw = $ty;
 
             fn as_ir_object(&self) -> ir_object {
@@ -318,7 +326,7 @@ macro_rules! ir_object_newtype {
             }
         }
 
-        impl AsIrRaw for Option<$t> {
+        impl AsIrRaw for Option<$t<'_>> {
             type Raw = $ty;
 
             fn as_ir_object(&self) -> ir_object {
@@ -330,19 +338,19 @@ macro_rules! ir_object_newtype {
 
             fn as_mut_ptr(&self) -> *mut Self::Raw {
                 match self {
-                    Some($t(p)) => p.as_ptr(),
+                    Some($t(p, ..)) => p.as_ptr(),
                     None => ptr::null_mut(),
                 }
             }
         }
 
-        impl FromIrRaw for $t {
+        impl FromIrRaw for $t<'_> {
             fn from_non_null(ptr: NonNull<Self::Raw>) -> Self {
-                Self(ptr)
+                Self(ptr, PhantomData)
             }
         }
 
-        impl std::fmt::Debug for $t {
+        impl std::fmt::Debug for $t<'_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 Debug::fmt(&self.as_ir_object(), f)
             }
@@ -352,7 +360,7 @@ macro_rules! ir_object_newtype {
 
 macro_rules! ir_object_id {
     ($t:ident) => {
-        impl IrId for $t {
+        impl IrId for $t<'_> {
             fn id(&self) -> usize {
                 unsafe { (*self.0.as_ptr()).id }
             }
@@ -362,7 +370,7 @@ macro_rules! ir_object_id {
 
 macro_rules! ir_object_comment {
     ($t:ident) => {
-        impl IrComment for $t {
+        impl IrComment for $t<'_> {
             fn comment(&self, comment: &[u8]) {
                 let comment = self.func().arena().alloc_str(comment);
 
@@ -397,7 +405,7 @@ ir_object_newtype!(IrLcl, ir_lcl, IR_OBJECT_TY_LCL, lcl);
 ir_object_newtype!(IrStmt, ir_stmt, IR_OBJECT_TY_STMT, stmt);
 ir_object_newtype!(IrOp, ir_op, IR_OBJECT_TY_OP, op);
 
-impl IrGlb {
+impl<'jcc> IrGlb<'jcc> {
     pub fn is_def(&self) -> bool {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
 
@@ -433,7 +441,7 @@ impl IrGlb {
         IrUnit::from_raw(p.unit)
     }
 
-    pub fn var(&self) -> IrVar {
+    pub fn var(&self) -> IrVar<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
             assert_eq!(p.ty, IR_GLB_TY_DATA, "expected ir_glb to be of ty data");
@@ -449,7 +457,7 @@ impl IrGlb {
         p.ty == IR_GLB_TY_FUNC
     }
 
-    pub fn func(&self) -> IrFunc {
+    pub fn func(&self) -> IrFunc<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
             assert_eq!(p.ty, IR_GLB_TY_FUNC, "expected ir_glb to be of ty func");
@@ -465,34 +473,33 @@ pub trait HasNext: Sized {
     fn next(&self) -> Option<Self>;
 }
 
-impl HasNext for IrBasicBlock {
+impl HasNext for IrBasicBlock<'_> {
     fn next(&self) -> Option<Self> {
         Self::new(unsafe { self.0.as_ref().succ })
     }
 }
 
-impl HasNext for IrStmt {
+impl HasNext for IrStmt<'_> {
     fn next(&self) -> Option<Self> {
         Self::new(unsafe { self.0.as_ref().succ })
     }
 }
 
-impl HasNext for IrOp {
+impl HasNext for IrOp<'_> {
     fn next(&self) -> Option<Self> {
         Self::new(unsafe { self.0.as_ref().succ })
     }
 }
 
 // NOTE: dangerous to iterate this while mutating
-pub struct IterFunc<'a, Parent, T: FromIrRaw + HasNext> {
-    func: &'a Parent,
+pub struct IterFunc<T: FromIrRaw + HasNext> {
     cur: Option<T>,
     sz: usize,
 }
 
-impl<'a, Parent, T: Copy + FromIrRaw + HasNext> ExactSizeIterator for IterFunc<'a, Parent, T> {}
+impl<T: Copy + FromIrRaw + HasNext> ExactSizeIterator for IterFunc<T> {}
 
-impl<'a, Parent, T: Copy + FromIrRaw + HasNext> Iterator for IterFunc<'a, Parent, T> {
+impl<T: Copy + FromIrRaw + HasNext> Iterator for IterFunc<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -507,29 +514,29 @@ impl<'a, Parent, T: Copy + FromIrRaw + HasNext> Iterator for IterFunc<'a, Parent
     }
 }
 
-pub struct IrVarValueListEl {
-    pub value: IrVarValue,
+pub struct IrVarValueListEl<'jcc> {
+    pub value: IrVarValue<'jcc>,
     pub offset: usize,
 }
 
-pub struct IrVarValueAddr {
-    pub glb: IrGlb,
+pub struct IrVarValueAddr<'jcc> {
+    pub glb: IrGlb<'jcc>,
     pub offset: usize,
 }
 
-pub enum IrVarValueTy {
+pub enum IrVarValueTy<'jcc> {
     Zero,
-    Addr(IrVarValueAddr),
+    Addr(IrVarValueAddr<'jcc>),
     Int(IrIntCnst),
-    List(Vec<IrVarValueListEl>),
+    List(Vec<IrVarValueListEl<'jcc>>),
 }
 
-pub struct IrVarValue {
-    pub ty: IrVarValueTy,
+pub struct IrVarValue<'jcc> {
+    pub ty: IrVarValueTy<'jcc>,
     pub var_ty: IrVarTy,
 }
 
-impl IrVarValue {
+impl IrVarValue<'_> {
     // TODO: we need unit (for `var_ty_bytes` and in turn `ir_var_ty_mk_array`) but kinda ugly
     pub fn from_bytes(unit: IrUnit, offset: usize, bytes: &[u8]) -> Self {
         let lst = bytes
@@ -620,7 +627,7 @@ pub fn mk_value(
     }
 }
 
-impl IrVar {
+impl IrVar<'_> {
     pub fn unit(&self) -> IrUnit {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrUnit::from_non_null(unsafe { NonNull::new_unchecked(p.unit) })
@@ -646,7 +653,7 @@ impl IrVar {
     }
 }
 
-impl IrFunc {
+impl<'jcc> IrFunc<'jcc> {
     pub fn arena(&self) -> ArenaAllocRef {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         ArenaAllocRef::from_raw(p.arena)
@@ -664,7 +671,7 @@ impl IrFunc {
         }
     }
 
-    pub fn mk_param_stmt(&self) -> IrStmt {
+    pub fn mk_param_stmt(&'jcc self) -> IrStmt<'jcc> {
         // TODO: ensure not called twice
         let bb = self.first().unwrap_or_else(|| self.alloc_basicblock());
 
@@ -681,26 +688,25 @@ impl IrFunc {
         }
     }
 
-    pub fn basicblocks<'a>(&'a self) -> IterFunc<'a, Self, IrBasicBlock> {
+    pub fn basicblocks(&self) -> IterFunc<IrBasicBlock<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IterFunc {
-            func: self,
             cur: self.first(),
             sz: p.basicblock_count,
         }
     }
 
-    pub fn first(&self) -> Option<IrBasicBlock> {
+    pub fn first(&self) -> Option<IrBasicBlock<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrBasicBlock::new(p.first)
     }
 
-    pub fn last(&self) -> Option<IrBasicBlock> {
+    pub fn last(&self) -> Option<IrBasicBlock<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrBasicBlock::new(p.last)
     }
 
-    pub fn get_param_op(&self, idx: usize) -> IrOp {
+    pub fn get_param_op(&self, idx: usize) -> IrOp<'jcc> {
         // FIXME: more efficient way to do this (JCC should probably have better UX here, probably a `ir_get_param_stmt` fn
         let stmt = self
             .first()
@@ -720,17 +726,17 @@ impl IrFunc {
         op
     }
 
-    pub fn alloc_basicblock(&self) -> IrBasicBlock {
+    pub fn alloc_basicblock(&self) -> IrBasicBlock<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe { IrBasicBlock::from_raw(ir_alloc_basicblock(p)) }
     }
 
-    pub fn add_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl {
+    pub fn add_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrLcl::from_raw(unsafe { ir_add_local(p, &var_ty) })
     }
 
-    pub fn add_param_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl {
+    pub fn add_param_local(&self, IrVarTy(var_ty): IrVarTy) -> IrLcl<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         let lcl = unsafe { ir_add_local(p, &var_ty) };
         (unsafe { *lcl }).flags |= IR_LCL_FLAG_PARAM;
@@ -738,22 +744,22 @@ impl IrFunc {
     }
 }
 
-pub enum IrBasicBlockTy<'a> {
+pub enum IrBasicBlockTy<'a, 'jcc> {
     Ret,
     Merge {
-        target: IrBasicBlock,
+        target: IrBasicBlock<'jcc>,
     },
     Split {
-        true_target: IrBasicBlock,
-        false_target: IrBasicBlock,
+        true_target: IrBasicBlock<'jcc>,
+        false_target: IrBasicBlock<'jcc>,
     },
     Switch {
-        default_target: IrBasicBlock,
-        cases: &'a [(u128, IrBasicBlock)],
+        default_target: IrBasicBlock<'jcc>,
+        cases: &'a [(u128, IrBasicBlock<'jcc>)],
     },
 }
 
-impl IrBasicBlock {
+impl<'jcc> IrBasicBlock<'jcc> {
     pub fn mk_ty(&self, ty: IrBasicBlockTy) {
         let func = self.func();
         let arena = func.unit().mk_arena();
@@ -801,31 +807,30 @@ impl IrBasicBlock {
         }
     }
 
-    pub fn func(&self) -> IrFunc {
+    pub fn func(&self) -> IrFunc<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrFunc::from_raw(p.func)
     }
 
-    pub fn first(&self) -> Option<IrStmt> {
+    pub fn first(&self) -> Option<IrStmt<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrStmt::new(p.first)
     }
 
-    pub fn last(&self) -> Option<IrStmt> {
+    pub fn last(&self) -> Option<IrStmt<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrStmt::new(p.last)
     }
 
-    pub fn stmts<'a>(&'a self) -> IterFunc<'a, Self, IrStmt> {
+    pub fn stmts(&self) -> IterFunc<IrStmt<'jcc>> {
         let p = unsafe { self.func().as_mut_ptr().as_mut_unchecked() };
         IterFunc {
-            func: self,
             cur: self.first(),
             sz: p.stmt_count,
         }
     }
 
-    pub fn alloc_stmt(&self) -> IrStmt {
+    pub fn alloc_stmt(&self) -> IrStmt<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
             // FIXME: inefficient
@@ -835,13 +840,13 @@ impl IrBasicBlock {
     }
 }
 
-impl IrStmt {
-    pub fn basicblock(&self) -> IrBasicBlock {
+impl<'jcc> IrStmt<'jcc> {
+    pub fn basicblock(&self) -> IrBasicBlock<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrBasicBlock::from_raw(p.basicblock)
     }
 
-    pub fn func(&self) -> IrFunc {
+    pub fn func(&self) -> IrFunc<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe { IrFunc::from_raw((*p.basicblock).func) }
     }
@@ -856,26 +861,25 @@ impl IrStmt {
         (p.flags & IR_STMT_FLAG_PHI) != 0
     }
 
-    pub fn first(&self) -> Option<IrOp> {
+    pub fn first(&self) -> Option<IrOp<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrOp::new(p.first)
     }
 
-    pub fn last(&self) -> Option<IrOp> {
+    pub fn last(&self) -> Option<IrOp<'jcc>> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrOp::new(p.last)
     }
 
-    pub fn ops<'a>(&'a self) -> IterFunc<'a, Self, IrOp> {
+    pub fn ops(&self) -> IterFunc<IrOp<'jcc>> {
         let p = unsafe { self.func().as_mut_ptr().as_mut_unchecked() };
         IterFunc {
-            func: self,
             cur: self.first(),
             sz: p.op_count,
         }
     }
 
-    pub fn alloc_op(&self) -> IrOp {
+    pub fn alloc_op(&self) -> IrOp<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe {
             // FIXME: inefficient
@@ -885,15 +889,15 @@ impl IrStmt {
     }
 }
 
-pub struct AddrOffset {
-    base: IrOp,
-    index: Option<IrOp>,
+pub struct AddrOffset<'jcc> {
+    base: IrOp<'jcc>,
+    index: Option<IrOp<'jcc>>,
     scale: usize,
     offset: usize,
 }
 
-impl AddrOffset {
-    pub fn offset(base: IrOp, offset: usize) -> Self {
+impl<'jcc> AddrOffset<'jcc> {
+    pub fn offset(base: IrOp<'jcc>, offset: usize) -> Self {
         Self {
             base,
             offset,
@@ -902,7 +906,7 @@ impl AddrOffset {
         }
     }
 
-    pub fn index(base: IrOp, index: IrOp, scale: NonZeroUsize) -> Self {
+    pub fn index(base: IrOp<'jcc>, index: IrOp<'jcc>, scale: NonZeroUsize) -> Self {
         Self {
             base,
             index: Some(index),
@@ -911,7 +915,12 @@ impl AddrOffset {
         }
     }
 
-    pub fn index_offset(base: IrOp, index: IrOp, scale: NonZeroUsize, offset: usize) -> Self {
+    pub fn index_offset(
+        base: IrOp<'jcc>,
+        index: IrOp<'jcc>,
+        scale: NonZeroUsize,
+        offset: usize,
+    ) -> Self {
         Self {
             base,
             index: Some(index),
@@ -994,14 +1003,14 @@ pub enum IrBinOpTy {
     Fdiv = IR_OP_BINARY_OP_TY_FDIV,
 }
 
-impl IrOp {
+impl<'jcc> IrOp<'jcc> {
     pub fn var_ty(&self) -> IrVarTy {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrVarTy(p.var_ty)
     }
 
     // hacky should have general way to do this
-    pub fn get_addr_lcl(&self) -> Option<IrLcl> {
+    pub fn get_addr_lcl(&self) -> Option<IrLcl<'jcc>> {
         unsafe {
             let p = self.0.as_ptr().as_mut_unchecked();
             if p.ty == IR_OP_TY_ADDR && p._1.addr.ty == IR_OP_ADDR_TY_LCL {
@@ -1012,17 +1021,17 @@ impl IrOp {
         None
     }
 
-    pub fn stmt(&self) -> IrStmt {
+    pub fn stmt(&self) -> IrStmt<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrStmt::from_raw(p.stmt)
     }
 
-    pub fn basicblock(&self) -> IrBasicBlock {
+    pub fn basicblock(&self) -> IrBasicBlock<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe { IrBasicBlock::from_raw((*p.stmt).basicblock) }
     }
 
-    pub fn func(&self) -> IrFunc {
+    pub fn func(&self) -> IrFunc<'jcc> {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         unsafe { IrFunc::from_raw((*(*p.stmt).basicblock).func) }
     }
@@ -1409,13 +1418,13 @@ pub enum IrLinkage {
     External = IR_LINKAGE_EXTERNAL,
 }
 
-impl IrUnit {
+impl<'jcc> IrUnit<'jcc> {
     pub fn add_global_def_var(
         &self,
         IrVarTy(var_ty): IrVarTy,
         name: Option<&str>,
         linkage: IrLinkage,
-    ) -> IrGlb {
+    ) -> IrGlb<'jcc> {
         unsafe {
             let arena = self.mk_arena();
             let name = name.map(|n| arena.alloc_str(n)).unwrap_or(ptr::null());
@@ -1443,7 +1452,7 @@ impl IrUnit {
                 },
             };
 
-            IrGlb(NonNull::new(glb).unwrap())
+            IrGlb::from_raw(glb)
         }
     }
 
@@ -1452,7 +1461,7 @@ impl IrUnit {
         IrVarTy(var_ty): IrVarTy,
         name: &str,
         linkage: IrLinkage,
-    ) -> IrGlb {
+    ) -> IrGlb<'jcc> {
         unsafe {
             let arena = self.mk_arena();
             let name = arena.alloc_str(name);
@@ -1467,7 +1476,7 @@ impl IrUnit {
             (*glb).linkage = linkage as _;
             (*glb)._1.func = ptr::null_mut();
 
-            IrGlb(NonNull::new(glb).unwrap())
+            IrGlb::from_raw(glb)
         }
     }
 
@@ -1476,7 +1485,7 @@ impl IrUnit {
         IrVarTy(var_ty): IrVarTy,
         name: &str,
         linkage: IrLinkage,
-    ) -> IrGlb {
+    ) -> IrGlb<'jcc> {
         unsafe {
             let arena = self.mk_arena();
             let name = arena.alloc_str(name);

@@ -48,12 +48,12 @@ use crate::{
 
 pub struct Builder<'a, 'tcx> {
     cx: &'a CodegenCx<'tcx>,
-    cur_bb: RefCell<Option<IrBasicBlock>>,
-    func: IrFunc,
+    cur_bb: RefCell<Option<IrBasicBlock<'tcx>>>,
+    func: IrFunc<'tcx>,
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
-    pub fn with_cx(cx: &'a CodegenCx<'tcx>, cur_bb: IrBasicBlock) -> Self {
+    pub fn with_cx(cx: &'a CodegenCx<'tcx>, cur_bb: IrBasicBlock<'tcx>) -> Self {
         Self {
             cx,
             func: cur_bb.func(),
@@ -61,7 +61,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
-    fn nop_cast(&mut self, value: IrBuildValue, dest_ty: IrVarTy) -> IrBuildValue {
+    fn nop_cast(&mut self, value: IrBuildValue<'tcx>, dest_ty: IrVarTy) -> IrBuildValue<'tcx> {
         let value = self.mk_op(value);
         self.mk_next_op(|op| op.mk_mov(dest_ty, value)).into()
     }
@@ -71,7 +71,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         const { NonZeroUsize::new(8).unwrap() }
     }
 
-    fn get_block(&self) -> IrBasicBlock {
+    fn get_block(&self) -> IrBasicBlock<'tcx> {
         self.cur_bb.borrow_mut().unwrap()
     }
 
@@ -84,7 +84,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     // marked 'mut' because 'mk_next_op' is _not_ and calling this within that closure will cause incorrect op orderings
-    pub fn mk_op(&mut self, value: IrBuildValue) -> IrOp {
+    pub fn mk_op(&mut self, value: IrBuildValue<'tcx>) -> IrOp<'tcx> {
         match value {
             IrBuildValue::Undf(var_ty) | IrBuildValue::Poison(var_ty) => {
                 if var_ty.is_primitive() {
@@ -119,7 +119,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
-    pub fn alloc_next_op(&self) -> IrOp {
+    pub fn alloc_next_op(&self) -> IrOp<'tcx> {
         let bb = self.get_block();
 
         let stmt = bb.alloc_stmt();
@@ -127,7 +127,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         stmt.alloc_op()
     }
 
-    pub fn mk_next_op(&self, mk: impl Fn(IrOp)) -> IrOp {
+    pub fn mk_next_op(&self, mk: impl Fn(IrOp)) -> IrOp<'tcx> {
         let op = self.alloc_next_op();
 
         mk(op);
@@ -137,11 +137,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
-    type Value = IrBuildValue;
+    type Value = IrBuildValue<'tcx>;
 
     type Metadata = ();
-    type Function = IrFunc;
-    type BasicBlock = IrBasicBlock;
+    type Function = IrFunc<'tcx>;
+    type BasicBlock = IrBasicBlock<'tcx>;
     type Type = IrVarTy;
     type Funclet = ();
     type DIScope = ();
@@ -948,7 +948,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
         fn scalar_load_metadata<'a, 'll, 'tcx>(
             bx: &mut Builder<'a, 'tcx>,
-            load: IrBuildValue,
+            load: IrBuildValue<'tcx>,
             scalar: rustc_abi::Scalar,
             layout: TyAndLayout<'tcx>,
             offset: rustc_abi::Size,

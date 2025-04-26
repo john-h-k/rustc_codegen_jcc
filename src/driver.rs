@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt::Write, num::NonZeroUsize, ops::Range};
+use std::{cell::RefCell, fmt::Write, mem, num::NonZeroUsize, ops::Range};
 
 use rustc_abi::{
     BackendRepr, FieldsShape, Float, HasDataLayout, Integer, Primitive, Scalar, Variants,
@@ -310,7 +310,7 @@ pub fn ty_to_jcc_ty<'tcx>(cx: &CodegenCx<'tcx>, ty_layout: &TyAndLayout<'tcx>) -
 }
 
 pub(crate) struct JccModule {
-    pub(crate) unit: IrUnit,
+    pub(crate) unit: IrUnit<'static>,
 }
 
 unsafe impl Send for JccModule {}
@@ -320,24 +320,25 @@ pub struct CodegenCx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     // not present for codegen_allocator
     pub cg_unit: Option<&'tcx CodegenUnit<'tcx>>,
-    pub unit: IrUnit,
+    pub unit: IrUnit<'tcx>,
     pub arena: ArenaAlloc,
 
-    pub glb_map: RefCell<FxHashMap<String, IrGlb>>,
-    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrBuildValue>>,
+    pub glb_map: RefCell<FxHashMap<String, IrGlb<'tcx>>>,
+    pub vtables:
+        RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), IrBuildValue<'tcx>>>,
 }
 
 impl<'tcx> CodegenCx<'tcx> {
-    fn try_get_glb_by_name(&self, name: &str) -> Option<IrGlb> {
+    fn try_get_glb_by_name(&self, name: &str) -> Option<IrGlb<'tcx>> {
         self.glb_map.borrow_mut().get(name).copied()
     }
 
-    fn try_get_glb(&self, instance: Instance<'tcx>) -> Option<IrGlb> {
+    fn try_get_glb(&self, instance: Instance<'tcx>) -> Option<IrGlb<'tcx>> {
         let sym = self.tcx.symbol_name(instance).name;
         self.try_get_glb_by_name(sym)
     }
 
-    fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb {
+    fn get_glb(&self, instance: Instance<'tcx>) -> IrGlb<'tcx> {
         // TODO: vis/link won't be updated properly in predefine_fn
         let sym = self.tcx.symbol_name(instance).name;
         let (_, params, ret) = self.abi_of(instance);
@@ -354,11 +355,11 @@ impl<'tcx> CodegenCx<'tcx> {
         glb
     }
 
-    fn alloc_bytes_var(&self, alloc: &ConstAllocation<'_>) -> IrGlb {
+    fn alloc_bytes_var(&self, alloc: &ConstAllocation<'_>) -> IrGlb<'tcx> {
         let arena = self.arena.as_ref();
         let alloc = alloc.inner();
 
-        let unit = self.unit;
+        let unit = &self.unit;
         let ty = unit.var_ty_bytes(alloc.len());
 
         let glb = unit.add_global_def_var(ty, None, IrLinkage::Internal);
@@ -514,26 +515,35 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
 // values can be created outside the context of a function (sigh)
 // so we need a flexible way to represent them
 #[derive(Debug, Clone, Copy)]
-pub enum IrBuildValue {
+pub enum IrBuildValue<'jcc> {
     Undf(IrVarTy),
     Poison(IrVarTy),
     Cnst(IrCnst),
-    Op(IrOp),
-    GlbAddr { glb: IrGlb, offset: usize },
+    Op(IrOp<'jcc>),
+    GlbAddr { glb: IrGlb<'jcc>, offset: usize },
 }
 
-impl From<IrOp> for IrBuildValue {
-    fn from(value: IrOp) -> Self {
+impl<'jcc> From<IrOp<'jcc>> for IrBuildValue<'jcc> {
+    fn from(value: IrOp<'jcc>) -> Self {
         Self::Op(value)
     }
 }
 
-impl IrBuildValue {
-    pub fn glb_addr(glb: IrGlb) -> Self {
+impl PartialEq for IrBuildValue<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (IrBuildValue::Op(l), IrBuildValue::Op(r)) => l == r,
+            _ => panic!("other eqs"),
+        }
+    }
+}
+
+impl<'jcc> IrBuildValue<'jcc> {
+    pub fn glb_addr(glb: IrGlb<'jcc>) -> Self {
         Self::GlbAddr { glb, offset: 0 }
     }
 
-    pub fn glb_addr_with_offset(glb: IrGlb, offset: usize) -> Self {
+    pub fn glb_addr_with_offset(glb: IrGlb<'jcc>, offset: usize) -> Self {
         Self::GlbAddr { glb, offset }
     }
 
@@ -543,18 +553,7 @@ impl IrBuildValue {
             cnst: IrCnstTy::Int(val),
         })
     }
-}
 
-impl PartialEq for IrBuildValue {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (IrBuildValue::Op(l), IrBuildValue::Op(r)) => l == r,
-            _ => panic!("other eqs"),
-        }
-    }
-}
-
-impl IrBuildValue {
     pub fn var_ty(&self) -> IrVarTy {
         match self {
             IrBuildValue::Cnst(IrCnst { var_ty, .. }) => *var_ty,
@@ -566,10 +565,10 @@ impl IrBuildValue {
 }
 
 impl<'tcx> BackendTypes for CodegenCx<'tcx> {
-    type Value = IrBuildValue;
+    type Value = IrBuildValue<'tcx>;
     type Metadata = ();
-    type Function = IrFunc;
-    type BasicBlock = IrBasicBlock;
+    type Function = IrFunc<'tcx>;
+    type BasicBlock = IrBasicBlock<'tcx>;
     type Type = IrVarTy;
     type Funclet = ();
     type DIScope = ();
@@ -1346,7 +1345,7 @@ impl<'tcx> CodegenCx<'tcx> {
         symbol_name: &str,
         params: &[IrVarTy],
         ret: &IrVarTy,
-    ) -> IrGlb {
+    ) -> IrGlb<'tcx> {
         // no `instance` param
         if let Some(glb) = self.try_get_glb_by_name(symbol_name) {
             return glb;
@@ -1379,7 +1378,7 @@ impl<'tcx> CodegenCx<'tcx> {
         symbol_name: &str,
         params: &[IrVarTy],
         ret: &IrVarTy,
-    ) -> IrGlb {
+    ) -> IrGlb<'tcx> {
         if let Some(glb) = self.try_get_glb_by_name(symbol_name) {
             return glb;
         }
@@ -1399,7 +1398,7 @@ impl<'tcx> CodegenCx<'tcx> {
         glb
     }
 
-    pub fn build_fn_params(&self, fun: IrFunc, params: &[IrVarTy]) -> IrBasicBlock {
+    pub fn build_fn_params(&self, fun: IrFunc<'tcx>, params: &[IrVarTy]) -> IrBasicBlock<'tcx> {
         // FIXME: recompute params in `declare_fn` and here
         let bb = fun.alloc_basicblock();
 
@@ -1422,7 +1421,7 @@ impl<'tcx> CodegenCx<'tcx> {
         bb
     }
 
-    fn ensure_defined(&self, fun: IrGlb, params: &[IrVarTy]) {
+    fn ensure_defined(&self, fun: IrGlb<'tcx>, params: &[IrVarTy]) {
         if !fun.is_def() {
             fun.mk_def();
 
@@ -1482,6 +1481,9 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub(crate) fn module(&self) -> JccModule {
-        JccModule { unit: self.unit }
+        // TODO: fix lifetimes here
+        JccModule {
+            unit: unsafe { mem::transmute(self.unit) },
+        }
     }
 }
