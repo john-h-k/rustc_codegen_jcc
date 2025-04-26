@@ -1496,11 +1496,6 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         funclet: Option<&Self::Funclet>,
         instance: Option<Instance<'tcx>>,
     ) -> Self::Value {
-        // TODO: fn ptr calls (not addr-glb)
-        // let Some(fn_glb) = llfn.get_addr_glb() else {
-        //     todo!("non direct calls");
-        // };
-
         let ret = match (fn_abi, instance) {
             (Some(f), Some(instance)) => self.abi_of(instance).2,
             _ => {

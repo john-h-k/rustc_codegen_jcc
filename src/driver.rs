@@ -1318,6 +1318,7 @@ impl<'tcx> CodegenCx<'tcx> {
 
                 (params, IrVarTy::ty_none())
             }
+            PassMode::Ignore => (params, self.type_none()),
             _ => {
                 // FIXME: does not support multi-el returns (bad!)
                 let ret = self.backend_type(ret.layout);
@@ -1333,6 +1334,7 @@ impl<'tcx> CodegenCx<'tcx> {
     ) -> (&FnAbi<'_, Ty<'tcx>>, Vec<IrVarTy>, IrVarTy) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (params, ret) = self.abi_fn_ty(fn_abi);
+
         (fn_abi, params, ret)
     }
 
