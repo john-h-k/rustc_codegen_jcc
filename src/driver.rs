@@ -387,8 +387,8 @@ impl<'tcx> CodegenCx<'tcx> {
                         alloc.inspect_with_uninit_and_ptr_outside_interpreter(range.clone());
 
                     Some(IrVarValueListEl {
-                        offset: range.start,
-                        value: IrVarValue::from_bytes(cx.unit, 0, bytes),
+                        offset: 0,
+                        value: IrVarValue::from_bytes(cx.unit, range.start, bytes),
                     })
                 }
                 InitChunk::Uninit(range) => {
@@ -397,8 +397,8 @@ impl<'tcx> CodegenCx<'tcx> {
                         alloc.inspect_with_uninit_and_ptr_outside_interpreter(range.clone());
 
                     Some(IrVarValueListEl {
-                        offset: range.start,
-                        value: IrVarValue::from_bytes(cx.unit, 0, bytes),
+                        offset: 0,
+                        value: IrVarValue::from_bytes(cx.unit, range.start, bytes),
                     })
                     // do nothing, all ranges outside of value lists are uninit
                     // (or they are zeroed currently i think? but they are _meant_ be uninit)
@@ -422,7 +422,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
 
                 llvals.push(IrVarValueListEl {
-                    offset,
+                    offset: 0,
                     value: IrVarValue::from_bytes(cx.unit, 0, bytes),
                 });
             }

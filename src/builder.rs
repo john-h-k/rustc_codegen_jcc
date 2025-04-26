@@ -97,7 +97,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
             }
 
-            IrBuildValue::Op(ir_op) => ir_op,
+            IrBuildValue::Op(ir_op) => {
+                // clone addr-lcl for nicer IR
+                if let Some(lcl) = ir_op.get_addr_lcl() {
+                    self.mk_next_op(|op| op.mk_addr_lcl(lcl))
+                } else {
+                    ir_op
+                }
+            }
             IrBuildValue::Cnst(ir_cnst) => self.mk_next_op(|op| op.mk_cnst(ir_cnst)),
             IrBuildValue::GlbAddr { glb, offset } => {
                 let base = self.mk_next_op(|op| op.mk_addr_glb(glb));
@@ -1150,6 +1157,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
+        let src_ty = val.var_ty();
+        if dest_ty.is_i8() && src_ty.is_i1() {
+            return self.nop_cast(val, dest_ty);
+        }
+
         let val = self.mk_op(val);
         self.mk_next_op(|op| op.mk_zext(dest_ty, val)).into()
     }
@@ -1380,8 +1392,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
         };
 
-        self.load(self.type_ptr(), addr.into(), rustc_abi::Align::EIGHT);
-        agg_val.into()
+        self.load(self.type_ptr(), addr.into(), rustc_abi::Align::EIGHT)
     }
 
     fn insert_value(&mut self, agg_val: Self::Value, elt: Self::Value, idx: u64) -> Self::Value {

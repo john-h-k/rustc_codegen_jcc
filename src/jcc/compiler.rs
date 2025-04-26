@@ -50,7 +50,8 @@ impl Compiler {
             let log_syms = [
                 // "_ZN3std2rt10lang_start17h4f5efa6f8ab6dfaeE"
                 // "_ZN4core3ptr101drop_in_place$LT$std..io..error..ErrorData$LT$alloc..boxed..Box$LT$std..io..error..Custom$GT$$GT$$GT$17h82cc1923ce8eb8b5E",
-                "_ZN4core6option15Option$LT$T$GT$6unwrap17hcac1e09190d54773E",
+                // "_ZN4core6option15Option$LT$T$GT$6unwrap17hcac1e09190d54773E",
+                // "_ZN11hello_world4main17h545698fc04f0cfe5E",
             ];
 
             let log_syms = {

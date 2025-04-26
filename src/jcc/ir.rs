@@ -367,7 +367,7 @@ macro_rules! ir_object_comment {
                 let comment = self.func().arena().alloc_str(comment);
 
                 let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
-                debug_assert!(p.comment.is_null(), "comment already set!");
+                // debug_assert!(p.comment.is_null(), "comment already set!");
                 p.comment = comment;
             }
         }
@@ -998,6 +998,18 @@ impl IrOp {
     pub fn var_ty(&self) -> IrVarTy {
         let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
         IrVarTy(p.var_ty)
+    }
+
+    // hacky should have general way to do this
+    pub fn get_addr_lcl(&self) -> Option<IrLcl> {
+        unsafe {
+            let p = self.0.as_ptr().as_mut_unchecked();
+            if p.ty == IR_OP_TY_ADDR && p._1.addr.ty == IR_OP_ADDR_TY_LCL {
+                return Some(IrLcl::from_raw(p._1.addr._1.lcl));
+            }
+        }
+
+        None
     }
 
     pub fn stmt(&self) -> IrStmt {
