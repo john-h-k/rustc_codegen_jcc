@@ -381,7 +381,9 @@ macro_rules! ir_object_comment {
                 let comment = self.func().arena().alloc_str(comment);
 
                 let p = unsafe { self.0.as_ptr().as_mut_unchecked() };
-                // debug_assert!(p.comment.is_null(), "comment already set!");
+
+                debug_assert!(p.comment.is_null(), "comment already set!");
+
                 p.comment = comment;
             }
         }
