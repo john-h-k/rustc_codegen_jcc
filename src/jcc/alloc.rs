@@ -1,6 +1,6 @@
 use std::{
     alloc::{AllocError, Allocator, Layout},
-    ffi::c_char,
+    ffi::{CStr, c_char},
     mem::{self},
     ops::Deref,
     os::unix::ffi::OsStrExt,
@@ -87,6 +87,12 @@ impl ArenaAllocRef {
 
     pub fn as_ptr(&self) -> *mut arena_allocator {
         self.0
+    }
+
+    pub fn alloc_cstr<StrLike: ArenaStrLike + ?Sized>(&self, str: &StrLike) -> &CStr {
+        // FIXME: rewrite to use less unsafe
+        let ptr = self.alloc_str(str);
+        unsafe { CStr::from_ptr(ptr) }
     }
 
     pub fn alloc_str<StrLike: ArenaStrLike + ?Sized>(&self, str: &StrLike) -> *const c_char {

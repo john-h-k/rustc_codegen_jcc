@@ -22,7 +22,7 @@ unsafe extern "C" {
     fn fflush(fp: *mut FILE) -> c_int;
 }
 
-struct OwnedCFile<T> {
+struct FlushGuard<T> {
     file: Option<T>,
     ptr: *mut FILE,
 }
@@ -33,7 +33,7 @@ fn as_c_file(file: &impl AsRawFd) -> *mut FILE {
     unsafe { fdopen(fd, mode.as_ptr().cast()) }
 }
 
-impl<T: AsRawFd> OwnedCFile<T> {
+impl<T: AsRawFd> FlushGuard<T> {
     // e.g for use with `stderr` which you do _not_ close
     fn borrow(from: T) -> Self {
         Self {
@@ -43,13 +43,13 @@ impl<T: AsRawFd> OwnedCFile<T> {
     }
 }
 
-impl OwnedCFile<Stderr> {
+impl FlushGuard<Stderr> {
     fn stderr() -> Self {
         Self::borrow(io::stderr())
     }
 }
 
-impl<T> Drop for OwnedCFile<T> {
+impl<T> Drop for FlushGuard<T> {
     fn drop(&mut self) {
         unsafe {
             fflush(self.ptr);
@@ -60,7 +60,7 @@ impl<T> Drop for OwnedCFile<T> {
 impl Debug for ir_object {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
-        let stderr = OwnedCFile::stderr();
+        let stderr = FlushGuard::stderr();
         unsafe {
             debug_print_ir_object(stderr.ptr, self, &debug_print_ir_opts::default());
         }
@@ -1747,7 +1747,7 @@ impl<'jcc> IrVarTy<'jcc> {
 impl Debug for IrVarTy<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
-        let stderr = OwnedCFile::stderr();
+        let stderr = FlushGuard::stderr();
         unsafe {
             debug_print_var_ty_string(stderr.ptr, &self.0);
         }
